@@ -428,6 +428,18 @@ extern bool DOSBox_Paused(), isDBCSCP(), InitCodePage();
 static Uint32 SDL_ticks_last = 0,SDL_ticks_next = 0;
 
 static Bitu Normal_Loop(void) {
+    static bool first_call = true;
+    if (first_call) {
+        first_call = false;
+        LOG_MSG("Normal_Loop: First call, C_REMOTEDEBUG is %s",
+#if C_REMOTEDEBUG
+                "ENABLED"
+#else
+                "DISABLED"
+#endif
+        );
+    }
+
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
 
