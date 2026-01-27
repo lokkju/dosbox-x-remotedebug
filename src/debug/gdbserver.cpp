@@ -124,9 +124,9 @@ GDBAction GDBServer::poll() {
     static int poll_count = 0;
     poll_count++;
 
-    // Log every 10000 polls to show we're being called
+    // Log every 10000 polls to show we're being called (LOG_NORMAL for visibility)
     if (poll_count % 10000 == 1) {
-        LOG(LOG_REMOTE, LOG_DEBUG)("GDBServer: poll() called (count=%d, running=%d, server_fd=%d, client_fd=%d)",
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: poll() called (count=%d, running=%d, server_fd=%d, client_fd=%d)",
                                     poll_count, running ? 1 : 0, server_fd, client_fd);
     }
 

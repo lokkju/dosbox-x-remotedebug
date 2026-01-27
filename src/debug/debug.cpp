@@ -6218,6 +6218,16 @@ uint32_t DEBUG_GetRegister(int reg) {
  // Polls the GDB server (non-blocking) and processes any received commands.
  // Returns true if CPU should be paused (caller should return from loop iteration).
  bool DEBUG_CheckGDBStep() {
+    static int call_count = 0;
+    call_count++;
+
+    // Debug logging every 10000 calls (using LOG_NORMAL to ensure visibility)
+    if (call_count % 10000 == 1) {
+        LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_CheckGDBStep: called (count=%d, gdbServer=%p, running=%d)",
+                                    call_count, (void*)gdbServer,
+                                    gdbServer ? gdbServer->is_running() : -1);
+    }
+
     if (gdbServer == nullptr || !gdbServer->is_running()) {
         return false;
     }
