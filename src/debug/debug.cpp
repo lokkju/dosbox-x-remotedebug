@@ -582,6 +582,7 @@ public:
 
 	// statics
 	static CBreakpoint*		AddBreakpoint		(uint16_t seg, uint32_t off, bool once);
+	static CBreakpoint*		AddBreakpointPhys	(PhysPt addr, bool once);
 	static CBreakpoint*		AddIntBreakpoint	(uint8_t intNum, uint16_t ah, uint16_t al, bool once);
 	static CBreakpoint*		AddMemBreakpoint	(uint16_t seg, uint32_t off);
 	static void				DeactivateBreakpoints();
@@ -593,6 +594,7 @@ public:
 	static CBreakpoint*		FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip);
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
+	static bool				DeleteBreakpointPhys(PhysPt addr);
 	static bool				DeleteByIndex		(uint16_t index);
 	static void				DeleteAll			(void);
 	static void				ShowList			(void);
@@ -674,6 +676,15 @@ CBreakpoint* CBreakpoint::AddBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
 	CBreakpoint* bp = new CBreakpoint();
 	bp->SetAddress		(seg,off);
+	bp->SetOnce			(once);
+	BPoints.push_front	(bp);
+	return bp;
+}
+
+CBreakpoint* CBreakpoint::AddBreakpointPhys(PhysPt addr, bool once)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->SetAddress		(addr);  // Uses direct physical address overload
 	bp->SetOnce			(once);
 	BPoints.push_front	(bp);
 	return bp;
@@ -904,6 +915,22 @@ bool CBreakpoint::DeleteBreakpoint(uint16_t seg, uint32_t off)
 		return true;
 	}
 
+	return false;
+}
+
+bool CBreakpoint::DeleteBreakpointPhys(PhysPt addr)
+{
+	// Search for breakpoint by physical address
+	std::list<CBreakpoint*>::iterator i;
+	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
+		CBreakpoint* bp = (*i);
+		if (bp->GetType() == BKPNT_PHYSICAL && bp->GetLocation() == addr) {
+			bp->Activate(false);  // Deactivate before removal (restores original byte)
+			BPoints.remove(bp);
+			delete bp;
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -6250,20 +6277,21 @@ uint32_t DEBUG_GetRegister(int reg) {
  }
 #endif
 
- #define FP_SEG(x) (uint16_t)((uint32_t)(x) >> 16)
- #define FP_OFF(x) (uint16_t)((uint32_t)(x))
+ // GDB remote protocol sends linear/physical addresses directly
+ // DO NOT interpret as packed segment:offset - that's incorrect!
  bool DEBUG_SetBreakpoint(uint32_t address) {
-     uint16_t seg = FP_SEG(address);
-     uint16_t off = FP_OFF(address);
-     DEBUG_ShowMsg("Adding Breakpoint %x:%x", seg, off);
-     return CBreakpoint::AddBreakpoint(seg, off, false);
+     DEBUG_ShowMsg("Adding Breakpoint at physical address 0x%x", address);
+     CBreakpoint* bp = CBreakpoint::AddBreakpointPhys((PhysPt)address, false);
+     if (bp) {
+         bp->Activate(true);  // Activate immediately for GDB
+         return true;
+     }
+     return false;
  }
 
  bool DEBUG_RemoveBreakpoint(uint32_t address) {
-     uint16_t seg = address >> 16;
-     uint16_t off = address;
-     DEBUG_ShowMsg("Removing Breakpoint %x:%x", seg, off);
-     return CBreakpoint::DeleteBreakpoint(seg, off);
+     DEBUG_ShowMsg("Removing Breakpoint at physical address 0x%x", address);
+     return CBreakpoint::DeleteBreakpointPhys((PhysPt)address);
  }
 
 #if C_REMOTEDEBUG
