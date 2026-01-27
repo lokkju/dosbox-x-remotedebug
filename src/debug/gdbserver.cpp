@@ -121,6 +121,15 @@ bool GDBServer::try_accept() {
 }
 
 GDBAction GDBServer::poll() {
+    static int poll_count = 0;
+    poll_count++;
+
+    // Log every 10000 polls to show we're being called
+    if (poll_count % 10000 == 1) {
+        LOG(LOG_REMOTE, LOG_DEBUG)("GDBServer: poll() called (count=%d, running=%d, server_fd=%d, client_fd=%d)",
+                                    poll_count, running ? 1 : 0, server_fd, client_fd);
+    }
+
     if (!running) return GDBAction::NONE;
 
     // Try to accept new client if we don't have one
