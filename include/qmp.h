@@ -47,7 +47,9 @@ enum class QMPInputEventType {
     KeyRelease,
     MouseButtonPress,
     MouseButtonRelease,
-    MouseMove
+    MouseMove,
+    JoystickMove,
+    JoystickButton
 };
 
 struct QMPInputEvent {
@@ -58,6 +60,15 @@ struct QMPInputEvent {
         struct {
             float x, y;      // For mouse move events
         } move;
+        struct {
+            Bitu which;      // Joystick 0 or 1
+            float x, y;      // Axis values -1.0 to 1.0
+        } joy_move;
+        struct {
+            Bitu which;      // Joystick 0 or 1
+            Bitu button;     // Button 0-1
+            bool pressed;
+        } joy_btn;
     };
 };
 
@@ -114,6 +125,8 @@ private:
     void handle_system_reset(const std::string& cmd);
     void handle_query_status();
     void handle_debug_break_on_exec(const std::string& cmd);
+    void handle_parport_write(const std::string& cmd);
+    void handle_parport_read(const std::string& cmd);
 
     // Key mapping
     static KBD_KEYS qcode_to_kbd(const std::string& qcode);
@@ -123,7 +136,10 @@ private:
     static std::string extract_string(const std::string& json, const std::string& key);
     static int extract_int(const std::string& json, const std::string& key, int default_val);
     static bool extract_bool(const std::string& json, const std::string& key, bool default_val);
+    static double extract_double(const std::string& json, const std::string& key, double default_val);
     static std::vector<std::string> extract_array(const std::string& json, const std::string& key);
+    static std::vector<int> extract_int_array(const std::string& json, const std::string& key);
+    static std::string extract_arguments(const std::string& json);
 };
 
 // Public interface for debug.cpp
