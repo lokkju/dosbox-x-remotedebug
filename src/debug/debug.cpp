@@ -963,16 +963,27 @@ void CBreakpoint::ShowList(void)
 
 bool DEBUG_Breakpoint(void)
 {
-	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
+	LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Called at CS:IP=%04X:%08X", SegValue(cs), reg_eip);
+
+	if (inhibit_int_breakpoint) {
+		LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: inhibit_int_breakpoint is true, returning false");
+		return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
+	}
 	/* First get the physical address and check for a set Breakpoint */
-	if (!CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) return false;
+	if (!CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
+		LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: No breakpoint found at this address, returning false");
+		return false;
+	}
 	// Found. Breakpoint is valid
+	LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Breakpoint found! Deactivating all breakpoints.");
 //	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
 
 #if C_REMOTEDEBUG
 	// Notify GDB server if connected - this is the key fix for GDB breakpoints!
 	// Without this, GDB sets breakpoints (0xCC) but never gets notified when hit
+	LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Checking GDB (gdbServer=%p, running=%d, has_client=%d)",
+		(void*)gdbServer, gdbServer ? gdbServer->is_running() : 0, gdbServer ? gdbServer->has_client() : 0);
 	if (gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
 		LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Hit! Notifying GDB at CS:IP=%04X:%08X", SegValue(cs), reg_eip);
 		gdbServer->send_stop_reply(5);  // SIGTRAP - breakpoint hit
