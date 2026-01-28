@@ -475,7 +475,12 @@ static Bitu Normal_Loop(void) {
     }
 
     try {
+        static int loop_iteration = 0;
         while (1) {
+            loop_iteration++;
+            if (loop_iteration <= 5 || loop_iteration % 100000 == 0) {
+                LOG_MSG("Normal_Loop: iteration %d", loop_iteration);
+            }
 #if C_REMOTEDEBUG
             // Check for GDB step/continue requests from the GDB server thread
             if (DEBUG_CheckGDBStep()) {
