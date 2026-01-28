@@ -445,10 +445,13 @@ void GDBServer::handle_write_memory(const std::string& args) {
 }
 
 void GDBServer::handle_breakpoint(const std::string& args) {
+    LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: handle_breakpoint called with args='%s'", args.c_str());
+
     char type = args[0];
     size_t comma1 = args.find(',');
     size_t comma2 = args.find(',', comma1 + 1);
     if (comma1 == std::string::npos || comma2 == std::string::npos) {
+        LOG(LOG_REMOTE, LOG_ERROR)("GDBServer: Breakpoint parse error - missing commas");
         send_packet("E01");
         return;
     }
@@ -456,15 +459,21 @@ void GDBServer::handle_breakpoint(const std::string& args) {
     int bp_type = std::stoi(args.substr(1, comma1 - 1));
     uint32_t address = std::stoul(args.substr(comma1 + 1, comma2 - comma1 - 1), nullptr, 16);
 
+    LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Breakpoint type=%c, bp_type=%d, address=0x%x", type, bp_type, address);
+
     if (bp_type != 0) {  // Only software breakpoints supported
+        LOG(LOG_REMOTE, LOG_WARN)("GDBServer: Non-software breakpoint type %d not supported", bp_type);
         send_packet("");
         return;
     }
 
     bool success;
     if (type == 'Z') {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Setting breakpoint at 0x%x", address);
         success = DEBUG_SetBreakpoint(address);
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: DEBUG_SetBreakpoint returned %s", success ? "true" : "false");
     } else {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Removing breakpoint at 0x%x", address);
         success = DEBUG_RemoveBreakpoint(address);
     }
 
