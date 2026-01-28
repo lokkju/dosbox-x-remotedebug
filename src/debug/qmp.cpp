@@ -34,6 +34,14 @@
 #include "debug.h"
 #include "hardware.h"
 #include "mouse.h"
+#include <iomanip>
+
+// External logging variables from debug_gui.cpp
+extern bool log_int21;
+extern bool log_fileio;
+extern void getlogtext(std::string &str);
+extern void clearlogtext();
+extern Bitu getlogbuffersize();
 
 static QMPServer* qmpServer = nullptr;
 
@@ -499,6 +507,16 @@ void QMPServer::process_command(const std::string& cmd) {
         handle_parport_write(cmd);
     } else if (execute == "parport-read") {
         handle_parport_read(cmd);
+    } else if (execute == "query-logging") {
+        handle_query_logging();
+    } else if (execute == "set-logging") {
+        handle_set_logging(cmd);
+    } else if (execute == "set-logging-category") {
+        handle_set_logging_category(cmd);
+    } else if (execute == "get-log-buffer") {
+        handle_get_log_buffer(cmd);
+    } else if (execute == "clear-log-buffer") {
+        handle_clear_log_buffer();
     } else if (execute == "quit" || execute == "system_powerdown") {
         send_success();
         // Don't actually quit DOSBox, just acknowledge
@@ -529,8 +547,13 @@ void QMPServer::handle_query_commands() {
         "{\"name\": \"cont\"},"
         "{\"name\": \"system_reset\"},"
         "{\"name\": \"debug-break-on-exec\"}," 
-        "{\"name\": \"parport-write\"}," 
-        "{\"name\": \"parport-read\"}"
+        "{\"name\": \"parport-write\"},"
+        "{\"name\": \"parport-read\"},"
+        "{\"name\": \"query-logging\"},"
+        "{\"name\": \"set-logging\"},"
+        "{\"name\": \"set-logging-category\"},"
+        "{\"name\": \"get-log-buffer\"},"
+        "{\"name\": \"clear-log-buffer\"}"
     "]}\r\n";
     send_response(response);
 }
@@ -1274,6 +1297,170 @@ void QMPServer::handle_parport_read(const std::string& cmd) {
         "\"control\": " + std::to_string(control) +
     "}}\r\n";
     send_response(response);
+}
+
+// JSON string escaping for log output
+std::string QMPServer::escape_json_string(const std::string& s) {
+    std::ostringstream escaped;
+    for (char c : s) {
+        switch (c) {
+            case '"':  escaped << "\\\""; break;
+            case '\\': escaped << "\\\\"; break;
+            case '\b': escaped << "\\b"; break;
+            case '\f': escaped << "\\f"; break;
+            case '\n': escaped << "\\n"; break;
+            case '\r': escaped << "\\r"; break;
+            case '\t': escaped << "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    escaped << "\\u00" << std::hex << std::setw(2)
+                            << std::setfill('0') << static_cast<int>(static_cast<unsigned char>(c));
+                } else {
+                    escaped << c;
+                }
+                break;
+        }
+    }
+    return escaped.str();
+}
+
+void QMPServer::handle_query_logging() {
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"int21\": " << (log_int21 ? "true" : "false") << ", "
+             << "\"fileio\": " << (log_fileio ? "true" : "false") << ", "
+             << "\"buffer_size\": " << getlogbuffersize()
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_set_logging(const std::string& cmd) {
+    std::string args = extract_arguments(cmd);
+    bool changed = false;
+
+    if (args.find("\"int21\"") != std::string::npos) {
+        bool new_val = extract_bool(args, "int21", log_int21);
+        if (new_val != log_int21) {
+            log_int21 = new_val;
+            changed = true;
+            LOG(LOG_REMOTE, LOG_NORMAL)("QMP: INT 21h logging %s", new_val ? "enabled" : "disabled");
+        }
+    }
+
+    if (args.find("\"fileio\"") != std::string::npos) {
+        bool new_val = extract_bool(args, "fileio", log_fileio);
+        if (new_val != log_fileio) {
+            log_fileio = new_val;
+            changed = true;
+            LOG(LOG_REMOTE, LOG_NORMAL)("QMP: File I/O logging %s", new_val ? "enabled" : "disabled");
+        }
+    }
+
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"int21\": " << (log_int21 ? "true" : "false") << ", "
+             << "\"fileio\": " << (log_fileio ? "true" : "false") << ", "
+             << "\"changed\": " << (changed ? "true" : "false")
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_set_logging_category(const std::string& cmd) {
+    std::string args = extract_arguments(cmd);
+    std::string category = extract_string(args, "category");
+    std::string level = extract_string(args, "level");
+
+    if (category.empty()) {
+        send_error("GenericError", "Missing 'category' argument");
+        return;
+    }
+
+    if (level.empty()) {
+        send_error("GenericError", "Missing 'level' argument. Valid: debug, normal, warn, error, fatal, never");
+        return;
+    }
+
+    int level_val = -1;
+    if (level == "debug") level_val = 0;
+    else if (level == "normal") level_val = 1;
+    else if (level == "warn") level_val = 2;
+    else if (level == "error") level_val = 3;
+    else if (level == "fatal") level_val = 4;
+    else if (level == "never") level_val = 5;
+    else {
+        send_error("GenericError", "Invalid level. Valid: debug, normal, warn, error, fatal, never");
+        return;
+    }
+
+    extern _LogGroup loggrp[];
+    bool found = false;
+    for (int i = 0; loggrp[i].front != NULL; i++) {
+        if (strcasecmp(loggrp[i].front, category.c_str()) == 0) {
+            loggrp[i].min_severity = static_cast<LOG_SEVERITIES>(level_val);
+            found = true;
+            LOG(LOG_REMOTE, LOG_NORMAL)("QMP: Log category '%s' set to %s", category.c_str(), level.c_str());
+            break;
+        }
+    }
+
+    if (!found) {
+        std::string valid_cats;
+        for (int i = 0; loggrp[i].front != NULL; i++) {
+            if (!valid_cats.empty()) valid_cats += ", ";
+            valid_cats += loggrp[i].front;
+        }
+        send_error("GenericError", "Unknown category '" + category + "'. Valid: " + valid_cats);
+        return;
+    }
+
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"category\": \"" << category << "\", "
+             << "\"level\": \"" << level << "\""
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_get_log_buffer(const std::string& cmd) {
+    std::string args = extract_arguments(cmd);
+    int limit = extract_int(args, "limit", 100);
+
+    std::string logs;
+    getlogtext(logs);
+
+    if (limit > 0 && !logs.empty()) {
+        std::vector<std::string> lines;
+        std::istringstream iss(logs);
+        std::string line;
+        while (std::getline(iss, line)) {
+            lines.push_back(line);
+        }
+
+        if (static_cast<int>(lines.size()) > limit) {
+            lines.erase(lines.begin(), lines.begin() + (lines.size() - limit));
+        }
+
+        logs.clear();
+        for (const auto& l : lines) {
+            if (!logs.empty()) logs += "\n";
+            logs += l;
+        }
+    }
+
+    std::string escaped = escape_json_string(logs);
+
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"line_count\": " << std::count(logs.begin(), logs.end(), '\n') + (logs.empty() ? 0 : 1) << ", "
+             << "\"lines\": \"" << escaped << "\""
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_clear_log_buffer() {
+    clearlogtext();
+    LOG(LOG_REMOTE, LOG_NORMAL)("QMP: Log buffer cleared");
+    send_success();
 }
 
 // Public interface
