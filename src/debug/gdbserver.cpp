@@ -142,25 +142,34 @@ GDBAction GDBServer::poll() {
     }
 
     // Read any available data
-    if (!receive_data()) {
-        // Client disconnected
+    bool client_disconnected = !receive_data();
+
+    // Process complete packets BEFORE handling disconnect
+    // (client may have sent data and then disconnected immediately)
+    while (has_complete_packet()) {
+        std::string packet = extract_packet();
+        if (packet.empty()) continue;
+
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Processing packet: '%s'", packet.c_str());
+        GDBAction action = process_command(packet);
+        if (action != GDBAction::NONE) {
+            // If client disconnected but we processed a command, still return the action
+            // The next poll() will handle the disconnect
+            if (client_disconnected) {
+                LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Processed final packet before disconnect");
+            }
+            return action;
+        }
+    }
+
+    // Now handle disconnect if needed
+    if (client_disconnected) {
         LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Client disconnected");
         close(client_fd);
         client_fd = -1;
         recv_buffer.clear();
         noack_mode = false;
         return GDBAction::DISCONNECT;
-    }
-
-    // Process complete packets
-    while (has_complete_packet()) {
-        std::string packet = extract_packet();
-        if (packet.empty()) continue;
-
-        GDBAction action = process_command(packet);
-        if (action != GDBAction::NONE) {
-            return action;
-        }
     }
 
     return GDBAction::NONE;
