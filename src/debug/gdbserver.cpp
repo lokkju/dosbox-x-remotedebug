@@ -172,6 +172,8 @@ bool GDBServer::receive_data() {
         ssize_t n = read(client_fd, buf, sizeof(buf));
         if (n > 0) {
             recv_buffer.append(buf, n);
+            LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Received %zd bytes, buffer now: '%s' (len=%zu)",
+                                        n, recv_buffer.c_str(), recv_buffer.length());
         } else if (n == 0) {
             // Connection closed
             return false;
@@ -188,8 +190,15 @@ bool GDBServer::receive_data() {
 }
 
 bool GDBServer::has_complete_packet() const {
+    // Log buffer contents for debugging (only when non-empty)
+    if (!recv_buffer.empty()) {
+        LOG(LOG_REMOTE, LOG_DEBUG)("GDBServer: has_complete_packet checking buffer: '%s' (len=%zu)",
+                                   recv_buffer.c_str(), recv_buffer.length());
+    }
+
     // Check for Ctrl-C (0x03)
     if (!recv_buffer.empty() && recv_buffer[0] == 0x03) {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Found Ctrl-C in buffer");
         return true;
     }
 
@@ -205,7 +214,11 @@ bool GDBServer::has_complete_packet() const {
     }
 
     // Need 2 more chars for checksum
-    return recv_buffer.length() >= hash + 3;
+    bool complete = recv_buffer.length() >= hash + 3;
+    if (complete) {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Found complete packet in buffer");
+    }
+    return complete;
 }
 
 std::string GDBServer::extract_packet() {
