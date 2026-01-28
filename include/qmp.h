@@ -115,6 +115,14 @@ private:
     void handle_query_status();
     void handle_debug_break_on_exec(const std::string& cmd);
 
+    // Logging control handlers
+    void handle_query_logging();
+    void handle_set_logging(const std::string& cmd);
+    void handle_set_logging_category(const std::string& cmd);
+    void handle_get_log_buffer(const std::string& cmd);
+    void handle_clear_log_buffer();
+    static std::string escape_json_string(const std::string& s);
+
     // Key mapping
     static KBD_KEYS qcode_to_kbd(const std::string& qcode);
     static const std::map<std::string, KBD_KEYS>& get_keymap();
