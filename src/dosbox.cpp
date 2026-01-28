@@ -431,7 +431,7 @@ static Bitu Normal_Loop(void) {
     static bool first_call = true;
     if (first_call) {
         first_call = false;
-        LOG(LOG_MISC, LOG_DEBUG)("Normal_Loop: First call, C_REMOTEDEBUG is %s",
+        LOG(LOG_MISC, LOG_NORMAL)("Normal_Loop: First call, C_REMOTEDEBUG is %s",
 #if C_REMOTEDEBUG
                 "ENABLED"
 #else
@@ -479,7 +479,7 @@ static Bitu Normal_Loop(void) {
         while (1) {
             loop_iteration++;
             if (loop_iteration <= 5 || loop_iteration % 100000 == 0) {
-                LOG(LOG_MISC, LOG_DEBUG)("Normal_Loop: iteration %d", loop_iteration);
+                LOG(LOG_MISC, LOG_NORMAL)("Normal_Loop: iteration %d", loop_iteration);
             }
 #if C_REMOTEDEBUG
             // Check for GDB step/continue requests from the GDB server thread
