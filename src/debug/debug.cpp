@@ -969,6 +969,20 @@ bool DEBUG_Breakpoint(void)
 	// Found. Breakpoint is valid
 //	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+
+#if C_REMOTEDEBUG
+	// Notify GDB server if connected - this is the key fix for GDB breakpoints!
+	// Without this, GDB sets breakpoints (0xCC) but never gets notified when hit
+	if (gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
+		LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Hit! Notifying GDB at CS:IP=%04X:%08X", SegValue(cs), reg_eip);
+		gdbServer->send_stop_reply(5);  // SIGTRAP - breakpoint hit
+		gdb_cpu_paused = true;          // Pause CPU until GDB sends continue/step
+		// Return true to prevent INT 3 from executing (we've already handled the breakpoint)
+		// The CPU will pause via debugCallback, and DEBUG_CheckGDBStep will handle GDB commands
+		return true;
+	}
+#endif
+
 	return true;
 }
 
@@ -4779,6 +4793,16 @@ void dyn_core_dh_debug_flush (void);
 #endif
 
 Bitu DEBUG_Loop(void) {
+#if C_REMOTEDEBUG
+    // If GDB has the CPU paused, don't enter the interactive debugger.
+    // Return to the normal loop where DEBUG_CheckGDBStep() handles GDB commands.
+    if (gdb_cpu_paused && gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
+        LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG_Loop: GDB paused, returning to normal loop");
+        DOSBOX_SetNormalLoop();
+        return 0;
+    }
+#endif
+
     if (debug_running) {
         Bitu now = SDL_GetTicks();
 
