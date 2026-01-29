@@ -39,6 +39,7 @@
 #include "nullmodem.h"
 #include "seriallog.h"
 #include "serialfile.h"
+#include "serialloopback.h"
 
 #include "cpu.h"
 
@@ -1397,6 +1398,12 @@ public:
 				serialports[i]->baud_multiplier = multiplier;
 				cmd.GetStringRemain(serialports[i]->commandLineString);
 			}
+			else if (type=="loopback") {
+				serialports[i] = new CSerialLoopback (i, &cmd);
+				serialports[i]->serialType = SERIAL_TYPE_LOOPBACK;
+				serialports[i]->baud_multiplier = multiplier;
+				cmd.GetStringRemain(serialports[i]->commandLineString);
+			}
 			else if (type=="serialmouse") {
 				serialports[i] = new CSerialMouse (i, &cmd);
 				serialports[i]->serialType = SERIAL_TYPE_MOUSE;
@@ -1468,6 +1475,7 @@ static const char *serialTypes[SERIAL_TYPE_COUNT] = {
 	"log",
 	"file",
 	"serialmouse",
+	"loopback",
 #if C_DIRECTSERIAL
 	"directserial",
 #endif
@@ -1598,6 +1606,9 @@ void SERIAL::Run()
 				break;
 			case SERIAL_TYPE_FILE:
 				serialports[port-1] = new CSerialFile(port-1, &cmd, squote);
+				break;
+			case SERIAL_TYPE_LOOPBACK:
+				serialports[port-1] = new CSerialLoopback(port-1, &cmd);
 				break;
 			case SERIAL_TYPE_MOUSE:
 				serialports[port-1] = new CSerialMouse(port-1, &cmd);

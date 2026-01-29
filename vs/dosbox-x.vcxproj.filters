@@ -993,6 +993,9 @@
     <ClCompile Include="..\src\hardware\serialport\serialfile.cpp">
       <Filter>Sources\hardware\serialport</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\hardware\serialport\serialloopback.cpp">
+      <Filter>Sources\hardware\serialport</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\libs\fluidsynth\fluid_adriver.c">
       <Filter>Sources\libs\fluidsynth</Filter>
     </ClCompile>
@@ -2544,6 +2547,9 @@
       <Filter>Sources</Filter>
     </ClInclude>
     <ClInclude Include="..\src\hardware\serialport\serialfile.h">
+      <Filter>Sources\hardware\serialport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\hardware\serialport\serialloopback.h">
       <Filter>Sources\hardware\serialport</Filter>
     </ClInclude>
     <ClInclude Include="..\src\hardware\opl2board\opl2board.h">
