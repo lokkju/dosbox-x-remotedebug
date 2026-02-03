@@ -29,9 +29,19 @@
 #include <sstream>
 #include "qmp.h"
 #include "logging.h"
+#include "joystick.h"
+#include "parport.h"
 #include "debug.h"
 #include "hardware.h"
 #include "mouse.h"
+#include <iomanip>
+
+// External logging variables from debug_gui.cpp
+extern bool log_int21;
+extern bool log_fileio;
+extern void getlogtext(std::string &str);
+extern void clearlogtext();
+extern Bitu getlogbuffersize();
 
 static QMPServer* qmpServer = nullptr;
 
@@ -206,6 +216,24 @@ bool QMPServer::extract_bool(const std::string& json, const std::string& key, bo
     return default_val;
 }
 
+double QMPServer::extract_double(const std::string& json, const std::string& key, double default_val) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return default_val;
+
+    pos = json.find(":", pos);
+    if (pos == std::string::npos) return default_val;
+
+    pos = json.find_first_not_of(" \t\n\r", pos + 1);
+    if (pos == std::string::npos) return default_val;
+
+    try {
+        return std::stod(json.substr(pos));
+    } catch (...) {
+        return default_val;
+    }
+}
+
 std::vector<std::string> QMPServer::extract_array(const std::string& json, const std::string& key) {
     std::vector<std::string> result;
     std::string search = "\"" + key + "\"";
@@ -235,6 +263,54 @@ std::vector<std::string> QMPServer::extract_array(const std::string& json, const
         }
     }
     return result;
+}
+
+std::vector<int> QMPServer::extract_int_array(const std::string& json, const std::string& key) {
+    std::vector<int> result;
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return result;
+
+    pos = json.find("[", pos);
+    if (pos == std::string::npos) return result;
+
+    size_t end = json.find("]", pos);
+    if (end == std::string::npos) return result;
+
+    std::string arr = json.substr(pos + 1, end - pos - 1);
+
+    // Extract integers from array
+    std::istringstream iss(arr);
+    std::string token;
+    while (std::getline(iss, token, ',')) {
+        // Trim whitespace
+        size_t start = token.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            try {
+                result.push_back(std::stoi(token.substr(start)));
+            } catch (...) {
+                // Skip invalid numbers
+            }
+        }
+    }
+    return result;
+}
+
+std::string QMPServer::extract_arguments(const std::string& json) {
+    size_t args_pos = json.find("\"arguments\"");
+    if (args_pos == std::string::npos) return "";
+
+    size_t brace = json.find("{", args_pos);
+    if (brace == std::string::npos) return "";
+
+    int depth = 1;
+    size_t end = brace + 1;
+    while (end < json.size() && depth > 0) {
+        if (json[end] == '{') depth++;
+        else if (json[end] == '}') depth--;
+        end++;
+    }
+    return json.substr(brace, end - brace);
 }
 
 void QMPServer::start() {
@@ -427,6 +503,20 @@ void QMPServer::process_command(const std::string& cmd) {
         handle_query_status();
     } else if (execute == "debug-break-on-exec") {
         handle_debug_break_on_exec(cmd);
+    } else if (execute == "parport-write") {
+        handle_parport_write(cmd);
+    } else if (execute == "parport-read") {
+        handle_parport_read(cmd);
+    } else if (execute == "query-logging") {
+        handle_query_logging();
+    } else if (execute == "set-logging") {
+        handle_set_logging(cmd);
+    } else if (execute == "set-logging-category") {
+        handle_set_logging_category(cmd);
+    } else if (execute == "get-log-buffer") {
+        handle_get_log_buffer(cmd);
+    } else if (execute == "clear-log-buffer") {
+        handle_clear_log_buffer();
     } else if (execute == "quit" || execute == "system_powerdown") {
         send_success();
         // Don't actually quit DOSBox, just acknowledge
@@ -456,7 +546,14 @@ void QMPServer::handle_query_commands() {
         "{\"name\": \"stop\"},"
         "{\"name\": \"cont\"},"
         "{\"name\": \"system_reset\"},"
-        "{\"name\": \"debug-break-on-exec\"}"
+        "{\"name\": \"debug-break-on-exec\"}," 
+        "{\"name\": \"parport-write\"},"
+        "{\"name\": \"parport-read\"},"
+        "{\"name\": \"query-logging\"},"
+        "{\"name\": \"set-logging\"},"
+        "{\"name\": \"set-logging-category\"},"
+        "{\"name\": \"get-log-buffer\"},"
+        "{\"name\": \"clear-log-buffer\"}"
     "]}\r\n";
     send_response(response);
 }
@@ -493,6 +590,13 @@ void QMPServer::process_pending_input_events() {
                 break;
             case QMPInputEventType::MouseMove:
                 Mouse_CursorMoved(event.move.x, event.move.y, 0, 0, true);
+                break;
+            case QMPInputEventType::JoystickMove:
+                JOYSTICK_Move_X(event.joy_move.which, event.joy_move.x);
+                JOYSTICK_Move_Y(event.joy_move.which, event.joy_move.y);
+                break;
+            case QMPInputEventType::JoystickButton:
+                JOYSTICK_Button(event.joy_btn.which, event.joy_btn.button, event.joy_btn.pressed);
                 break;
         }
 
@@ -630,6 +734,43 @@ void QMPServer::handle_input_send_event(const std::string& cmd) {
             input_event.type = down ? QMPInputEventType::MouseButtonPress : QMPInputEventType::MouseButtonRelease;
             input_event.button = btn_id;
             queue_input_event(input_event);
+        } else if (type == "joy") {
+            // Joystick axis movement
+            // Format: {"type": "joy", "data": {"which": 0, "axis": "x", "value": 0.5}}
+            int which = extract_int(data_str, "which", 0);
+            std::string axis = extract_string(data_str, "axis");
+            float value = static_cast<float>(extract_double(data_str, "value", 0.0));
+
+            // Clamp to -1.0 to 1.0
+            if (value < -1.0f) value = -1.0f;
+            if (value > 1.0f) value = 1.0f;
+
+            // Call directly (joystick doesn't need event queue)
+            if (axis == "x") {
+                JOYSTICK_Move_X(which, value);
+            } else if (axis == "y") {
+                JOYSTICK_Move_Y(which, value);
+            } else {
+                LOG(LOG_REMOTE, LOG_WARN)("QMP: Unknown joystick axis: %s", axis.c_str());
+            }
+        } else if (type == "joybtn") {
+            // Joystick button
+            // Format: {"type": "joybtn", "data": {"which": 0, "button": 0, "down": true}}
+            int which = extract_int(data_str, "which", 0);
+            int button = extract_int(data_str, "button", 0);
+            bool down = extract_bool(data_str, "down", true);
+
+            // Validate: 2 joysticks (0-1), 2 buttons each (0-1)
+            if (which < 0 || which > 1) {
+                LOG(LOG_REMOTE, LOG_WARN)("QMP: Invalid joystick: %d (use 0-1)", which);
+                continue;
+            }
+            if (button < 0 || button > 1) {
+                LOG(LOG_REMOTE, LOG_WARN)("QMP: Invalid button: %d (use 0-1)", button);
+                continue;
+            }
+
+            JOYSTICK_Button(which, button, down);
         }
     }
 
@@ -1093,6 +1234,233 @@ void QMPServer::handle_debug_break_on_exec(const std::string& cmd) {
     std::ostringstream response;
     response << "{\"return\": {\"enabled\": " << (enabled ? "true" : "false") << "}}\r\n";
     send_response(response.str());
+}
+
+
+void QMPServer::handle_parport_write(const std::string& cmd) {
+    // Write data to parallel port
+    // Format: {"execute": "parport-write", "arguments": {"port": 1, "data": [0x41, 0x42]}}
+    std::string args_str = extract_arguments(cmd);
+    int port = extract_int(args_str, "port", 1);  // LPT1 default
+    std::vector<int> data = extract_int_array(args_str, "data");
+
+    if (port < 1 || port > 3) {
+        send_error("GenericError", "Invalid port (use 1-3 for LPT1-LPT3)");
+        return;
+    }
+
+    // Get parallel port instance
+    extern CParallel* parallelPortObjects[];
+    CParallel* lpt = parallelPortObjects[port - 1];
+
+    if (!lpt) {
+        send_error("GenericError", "Parallel port not configured");
+        return;
+    }
+
+    int written = 0;
+    for (int byte : data) {
+        lpt->Putchar(static_cast<uint8_t>(byte));
+        written++;
+    }
+
+    std::string response = "{\"return\": {\"written\": " + std::to_string(written) + "}}\r\n";
+    send_response(response);
+}
+
+void QMPServer::handle_parport_read(const std::string& cmd) {
+    // Read parallel port status
+    // Format: {"execute": "parport-read", "arguments": {"port": 1}}
+    std::string args_str = extract_arguments(cmd);
+    int port = extract_int(args_str, "port", 1);
+
+    if (port < 1 || port > 3) {
+        send_error("GenericError", "Invalid port (use 1-3 for LPT1-LPT3)");
+        return;
+    }
+
+    extern CParallel* parallelPortObjects[];
+    CParallel* lpt = parallelPortObjects[port - 1];
+
+    if (!lpt) {
+        send_error("GenericError", "Parallel port not configured");
+        return;
+    }
+
+    Bitu data = lpt->Read_PR();
+    Bitu status = lpt->Read_SR();
+    Bitu control = lpt->Read_COM();
+
+    std::string response = "{\"return\": {"
+        "\"data\": " + std::to_string(data) + ","
+        "\"status\": " + std::to_string(status) + ","
+        "\"control\": " + std::to_string(control) +
+    "}}\r\n";
+    send_response(response);
+}
+
+// JSON string escaping for log output
+std::string QMPServer::escape_json_string(const std::string& s) {
+    std::ostringstream escaped;
+    for (char c : s) {
+        switch (c) {
+            case '"':  escaped << "\\\""; break;
+            case '\\': escaped << "\\\\"; break;
+            case '\b': escaped << "\\b"; break;
+            case '\f': escaped << "\\f"; break;
+            case '\n': escaped << "\\n"; break;
+            case '\r': escaped << "\\r"; break;
+            case '\t': escaped << "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    escaped << "\\u00" << std::hex << std::setw(2)
+                            << std::setfill('0') << static_cast<int>(static_cast<unsigned char>(c));
+                } else {
+                    escaped << c;
+                }
+                break;
+        }
+    }
+    return escaped.str();
+}
+
+void QMPServer::handle_query_logging() {
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"int21\": " << (log_int21 ? "true" : "false") << ", "
+             << "\"fileio\": " << (log_fileio ? "true" : "false") << ", "
+             << "\"buffer_size\": " << getlogbuffersize()
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_set_logging(const std::string& cmd) {
+    std::string args = extract_arguments(cmd);
+    bool changed = false;
+
+    if (args.find("\"int21\"") != std::string::npos) {
+        bool new_val = extract_bool(args, "int21", log_int21);
+        if (new_val != log_int21) {
+            log_int21 = new_val;
+            changed = true;
+            LOG(LOG_REMOTE, LOG_NORMAL)("QMP: INT 21h logging %s", new_val ? "enabled" : "disabled");
+        }
+    }
+
+    if (args.find("\"fileio\"") != std::string::npos) {
+        bool new_val = extract_bool(args, "fileio", log_fileio);
+        if (new_val != log_fileio) {
+            log_fileio = new_val;
+            changed = true;
+            LOG(LOG_REMOTE, LOG_NORMAL)("QMP: File I/O logging %s", new_val ? "enabled" : "disabled");
+        }
+    }
+
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"int21\": " << (log_int21 ? "true" : "false") << ", "
+             << "\"fileio\": " << (log_fileio ? "true" : "false") << ", "
+             << "\"changed\": " << (changed ? "true" : "false")
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_set_logging_category(const std::string& cmd) {
+    std::string args = extract_arguments(cmd);
+    std::string category = extract_string(args, "category");
+    std::string level = extract_string(args, "level");
+
+    if (category.empty()) {
+        send_error("GenericError", "Missing 'category' argument");
+        return;
+    }
+
+    if (level.empty()) {
+        send_error("GenericError", "Missing 'level' argument. Valid: debug, normal, warn, error, fatal, never");
+        return;
+    }
+
+    int level_val = -1;
+    if (level == "debug") level_val = 0;
+    else if (level == "normal") level_val = 1;
+    else if (level == "warn") level_val = 2;
+    else if (level == "error") level_val = 3;
+    else if (level == "fatal") level_val = 4;
+    else if (level == "never") level_val = 5;
+    else {
+        send_error("GenericError", "Invalid level. Valid: debug, normal, warn, error, fatal, never");
+        return;
+    }
+
+    extern _LogGroup loggrp[];
+    bool found = false;
+    for (int i = 0; loggrp[i].front != NULL; i++) {
+        if (strcasecmp(loggrp[i].front, category.c_str()) == 0) {
+            loggrp[i].min_severity = static_cast<LOG_SEVERITIES>(level_val);
+            found = true;
+            LOG(LOG_REMOTE, LOG_NORMAL)("QMP: Log category '%s' set to %s", category.c_str(), level.c_str());
+            break;
+        }
+    }
+
+    if (!found) {
+        std::string valid_cats;
+        for (int i = 0; loggrp[i].front != NULL; i++) {
+            if (!valid_cats.empty()) valid_cats += ", ";
+            valid_cats += loggrp[i].front;
+        }
+        send_error("GenericError", "Unknown category '" + category + "'. Valid: " + valid_cats);
+        return;
+    }
+
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"category\": \"" << category << "\", "
+             << "\"level\": \"" << level << "\""
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_get_log_buffer(const std::string& cmd) {
+    std::string args = extract_arguments(cmd);
+    int limit = extract_int(args, "limit", 100);
+
+    std::string logs;
+    getlogtext(logs);
+
+    if (limit > 0 && !logs.empty()) {
+        std::vector<std::string> lines;
+        std::istringstream iss(logs);
+        std::string line;
+        while (std::getline(iss, line)) {
+            lines.push_back(line);
+        }
+
+        if (static_cast<int>(lines.size()) > limit) {
+            lines.erase(lines.begin(), lines.begin() + (lines.size() - limit));
+        }
+
+        logs.clear();
+        for (const auto& l : lines) {
+            if (!logs.empty()) logs += "\n";
+            logs += l;
+        }
+    }
+
+    std::string escaped = escape_json_string(logs);
+
+    std::ostringstream response;
+    response << "{\"return\": {"
+             << "\"line_count\": " << std::count(logs.begin(), logs.end(), '\n') + (logs.empty() ? 0 : 1) << ", "
+             << "\"lines\": \"" << escaped << "\""
+             << "}}\r\n";
+    send_response(response.str());
+}
+
+void QMPServer::handle_clear_log_buffer() {
+    clearlogtext();
+    LOG(LOG_REMOTE, LOG_NORMAL)("QMP: Log buffer cleared");
+    send_success();
 }
 
 // Public interface

@@ -428,6 +428,18 @@ extern bool DOSBox_Paused(), isDBCSCP(), InitCodePage();
 static Uint32 SDL_ticks_last = 0,SDL_ticks_next = 0;
 
 static Bitu Normal_Loop(void) {
+    static bool first_call = true;
+    if (first_call) {
+        first_call = false;
+        LOG(LOG_REMOTE, LOG_NORMAL)("Normal_Loop: First call, C_REMOTEDEBUG is %s",
+#if C_REMOTEDEBUG
+                "ENABLED"
+#else
+                "DISABLED"
+#endif
+        );
+    }
+
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
 
@@ -463,7 +475,12 @@ static Bitu Normal_Loop(void) {
     }
 
     try {
+        static int loop_iteration = 0;
         while (1) {
+            loop_iteration++;
+            if (loop_iteration <= 5 || loop_iteration % 100000 == 0) {
+                LOG(LOG_REMOTE, LOG_NORMAL)("Normal_Loop: iteration %d", loop_iteration);
+            }
 #if C_REMOTEDEBUG
             // Check for GDB step/continue requests from the GDB server thread
             if (DEBUG_CheckGDBStep()) {

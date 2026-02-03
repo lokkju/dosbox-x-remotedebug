@@ -582,6 +582,7 @@ public:
 
 	// statics
 	static CBreakpoint*		AddBreakpoint		(uint16_t seg, uint32_t off, bool once);
+	static CBreakpoint*		AddBreakpointPhys	(PhysPt addr, bool once);
 	static CBreakpoint*		AddIntBreakpoint	(uint8_t intNum, uint16_t ah, uint16_t al, bool once);
 	static CBreakpoint*		AddMemBreakpoint	(uint16_t seg, uint32_t off);
 	static void				DeactivateBreakpoints();
@@ -593,6 +594,7 @@ public:
 	static CBreakpoint*		FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip);
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
+	static bool				DeleteBreakpointPhys(PhysPt addr);
 	static bool				DeleteByIndex		(uint16_t index);
 	static void				DeleteAll			(void);
 	static void				ShowList			(void);
@@ -674,6 +676,15 @@ CBreakpoint* CBreakpoint::AddBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
 	CBreakpoint* bp = new CBreakpoint();
 	bp->SetAddress		(seg,off);
+	bp->SetOnce			(once);
+	BPoints.push_front	(bp);
+	return bp;
+}
+
+CBreakpoint* CBreakpoint::AddBreakpointPhys(PhysPt addr, bool once)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->SetAddress		(addr);  // Uses direct physical address overload
 	bp->SetOnce			(once);
 	BPoints.push_front	(bp);
 	return bp;
@@ -907,6 +918,22 @@ bool CBreakpoint::DeleteBreakpoint(uint16_t seg, uint32_t off)
 	return false;
 }
 
+bool CBreakpoint::DeleteBreakpointPhys(PhysPt addr)
+{
+	// Search for breakpoint by physical address
+	std::list<CBreakpoint*>::iterator i;
+	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
+		CBreakpoint* bp = (*i);
+		if (bp->GetType() == BKPNT_PHYSICAL && bp->GetLocation() == addr) {
+			bp->Activate(false);  // Deactivate before removal (restores original byte)
+			BPoints.remove(bp);
+			delete bp;
+			return true;
+		}
+	}
+	return false;
+}
+
 
 void CBreakpoint::ShowList(void)
 {
@@ -936,12 +963,37 @@ void CBreakpoint::ShowList(void)
 
 bool DEBUG_Breakpoint(void)
 {
-	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
+	LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Called at CS:IP=%04X:%08X", SegValue(cs), reg_eip);
+
+	if (inhibit_int_breakpoint) {
+		LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: inhibit_int_breakpoint is true, returning false");
+		return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
+	}
 	/* First get the physical address and check for a set Breakpoint */
-	if (!CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) return false;
+	if (!CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
+		LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: No breakpoint found at this address, returning false");
+		return false;
+	}
 	// Found. Breakpoint is valid
+	LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Breakpoint found! Deactivating all breakpoints.");
 //	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+
+#if C_REMOTEDEBUG
+	// Notify GDB server if connected - this is the key fix for GDB breakpoints!
+	// Without this, GDB sets breakpoints (0xCC) but never gets notified when hit
+	LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Checking GDB (gdbServer=%p, running=%d, has_client=%d)",
+		(void*)gdbServer, gdbServer ? gdbServer->is_running() : 0, gdbServer ? gdbServer->has_client() : 0);
+	if (gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
+		LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_Breakpoint: Hit! Notifying GDB at CS:IP=%04X:%08X", SegValue(cs), reg_eip);
+		gdbServer->send_stop_reply(5);  // SIGTRAP - breakpoint hit
+		gdb_cpu_paused = true;          // Pause CPU until GDB sends continue/step
+		// Return true to prevent INT 3 from executing (we've already handled the breakpoint)
+		// The CPU will pause via debugCallback, and DEBUG_CheckGDBStep will handle GDB commands
+		return true;
+	}
+#endif
+
 	return true;
 }
 
@@ -4752,6 +4804,16 @@ void dyn_core_dh_debug_flush (void);
 #endif
 
 Bitu DEBUG_Loop(void) {
+#if C_REMOTEDEBUG
+    // If GDB has the CPU paused, don't enter the interactive debugger.
+    // Return to the normal loop where DEBUG_CheckGDBStep() handles GDB commands.
+    if (gdb_cpu_paused && gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
+        LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG_Loop: GDB paused, returning to normal loop");
+        DOSBOX_SetNormalLoop();
+        return 0;
+    }
+#endif
+
     if (debug_running) {
         Bitu now = SDL_GetTicks();
 
@@ -6191,6 +6253,16 @@ uint32_t DEBUG_GetRegister(int reg) {
  // Polls the GDB server (non-blocking) and processes any received commands.
  // Returns true if CPU should be paused (caller should return from loop iteration).
  bool DEBUG_CheckGDBStep() {
+    static int call_count = 0;
+    call_count++;
+
+    // Debug logging every 10000 calls (using LOG_NORMAL to ensure visibility)
+    if (call_count % 10000 == 1) {
+        LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG_CheckGDBStep: called (count=%d, gdbServer=%p, running=%d)",
+                                    call_count, (void*)gdbServer,
+                                    gdbServer ? gdbServer->is_running() : -1);
+    }
+
     if (gdbServer == nullptr || !gdbServer->is_running()) {
         return false;
     }
@@ -6250,20 +6322,21 @@ uint32_t DEBUG_GetRegister(int reg) {
  }
 #endif
 
- #define FP_SEG(x) (uint16_t)((uint32_t)(x) >> 16)
- #define FP_OFF(x) (uint16_t)((uint32_t)(x))
+ // GDB remote protocol sends linear/physical addresses directly
+ // DO NOT interpret as packed segment:offset - that's incorrect!
  bool DEBUG_SetBreakpoint(uint32_t address) {
-     uint16_t seg = FP_SEG(address);
-     uint16_t off = FP_OFF(address);
-     DEBUG_ShowMsg("Adding Breakpoint %x:%x", seg, off);
-     return CBreakpoint::AddBreakpoint(seg, off, false);
+     DEBUG_ShowMsg("Adding Breakpoint at physical address 0x%x", address);
+     CBreakpoint* bp = CBreakpoint::AddBreakpointPhys((PhysPt)address, false);
+     if (bp) {
+         bp->Activate(true);  // Activate immediately for GDB
+         return true;
+     }
+     return false;
  }
 
  bool DEBUG_RemoveBreakpoint(uint32_t address) {
-     uint16_t seg = address >> 16;
-     uint16_t off = address;
-     DEBUG_ShowMsg("Removing Breakpoint %x:%x", seg, off);
-     return CBreakpoint::DeleteBreakpoint(seg, off);
+     DEBUG_ShowMsg("Removing Breakpoint at physical address 0x%x", address);
+     return CBreakpoint::DeleteBreakpointPhys((PhysPt)address);
  }
 
 #if C_REMOTEDEBUG

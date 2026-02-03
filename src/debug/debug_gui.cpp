@@ -117,6 +117,16 @@ void getlogtext(std::string &str) {
         str+= (std::string)(*it)+"\n";
 }
 
+void clearlogtext() {
+    logBuff.clear();
+    logBuffPos = logBuff.end();
+    logBuffHasDiscarded = false;
+}
+
+Bitu getlogbuffersize() {
+    return logBuff.size();
+}
+
 bool savetologfile(const char *name) {
     std::ofstream out(name);
     if (!out.is_open()) return false;

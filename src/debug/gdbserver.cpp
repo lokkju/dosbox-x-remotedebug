@@ -121,6 +121,15 @@ bool GDBServer::try_accept() {
 }
 
 GDBAction GDBServer::poll() {
+    static int poll_count = 0;
+    poll_count++;
+
+    // Log every 10000 polls to show we're being called (LOG_NORMAL for visibility)
+    if (poll_count % 10000 == 1) {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: poll() called (count=%d, running=%d, server_fd=%d, client_fd=%d)",
+                                    poll_count, running ? 1 : 0, server_fd, client_fd);
+    }
+
     if (!running) return GDBAction::NONE;
 
     // Try to accept new client if we don't have one
@@ -133,25 +142,34 @@ GDBAction GDBServer::poll() {
     }
 
     // Read any available data
-    if (!receive_data()) {
-        // Client disconnected
+    bool client_disconnected = !receive_data();
+
+    // Process complete packets BEFORE handling disconnect
+    // (client may have sent data and then disconnected immediately)
+    while (has_complete_packet()) {
+        std::string packet = extract_packet();
+        if (packet.empty()) continue;
+
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Processing packet: '%s'", packet.c_str());
+        GDBAction action = process_command(packet);
+        if (action != GDBAction::NONE) {
+            // If client disconnected but we processed a command, still return the action
+            // The next poll() will handle the disconnect
+            if (client_disconnected) {
+                LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Processed final packet before disconnect");
+            }
+            return action;
+        }
+    }
+
+    // Now handle disconnect if needed
+    if (client_disconnected) {
         LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Client disconnected");
         close(client_fd);
         client_fd = -1;
         recv_buffer.clear();
         noack_mode = false;
         return GDBAction::DISCONNECT;
-    }
-
-    // Process complete packets
-    while (has_complete_packet()) {
-        std::string packet = extract_packet();
-        if (packet.empty()) continue;
-
-        GDBAction action = process_command(packet);
-        if (action != GDBAction::NONE) {
-            return action;
-        }
     }
 
     return GDBAction::NONE;
@@ -163,6 +181,8 @@ bool GDBServer::receive_data() {
         ssize_t n = read(client_fd, buf, sizeof(buf));
         if (n > 0) {
             recv_buffer.append(buf, n);
+            LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Received %zd bytes, buffer now: '%s' (len=%zu)",
+                                        n, recv_buffer.c_str(), recv_buffer.length());
         } else if (n == 0) {
             // Connection closed
             return false;
@@ -179,8 +199,15 @@ bool GDBServer::receive_data() {
 }
 
 bool GDBServer::has_complete_packet() const {
+    // Log buffer contents for debugging (only when non-empty)
+    if (!recv_buffer.empty()) {
+        LOG(LOG_REMOTE, LOG_DEBUG)("GDBServer: has_complete_packet checking buffer: '%s' (len=%zu)",
+                                   recv_buffer.c_str(), recv_buffer.length());
+    }
+
     // Check for Ctrl-C (0x03)
     if (!recv_buffer.empty() && recv_buffer[0] == 0x03) {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Found Ctrl-C in buffer");
         return true;
     }
 
@@ -196,7 +223,11 @@ bool GDBServer::has_complete_packet() const {
     }
 
     // Need 2 more chars for checksum
-    return recv_buffer.length() >= hash + 3;
+    bool complete = recv_buffer.length() >= hash + 3;
+    if (complete) {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Found complete packet in buffer");
+    }
+    return complete;
 }
 
 std::string GDBServer::extract_packet() {
@@ -436,10 +467,13 @@ void GDBServer::handle_write_memory(const std::string& args) {
 }
 
 void GDBServer::handle_breakpoint(const std::string& args) {
+    LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: handle_breakpoint called with args='%s'", args.c_str());
+
     char type = args[0];
     size_t comma1 = args.find(',');
     size_t comma2 = args.find(',', comma1 + 1);
     if (comma1 == std::string::npos || comma2 == std::string::npos) {
+        LOG(LOG_REMOTE, LOG_ERROR)("GDBServer: Breakpoint parse error - missing commas");
         send_packet("E01");
         return;
     }
@@ -447,15 +481,21 @@ void GDBServer::handle_breakpoint(const std::string& args) {
     int bp_type = std::stoi(args.substr(1, comma1 - 1));
     uint32_t address = std::stoul(args.substr(comma1 + 1, comma2 - comma1 - 1), nullptr, 16);
 
+    LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Breakpoint type=%c, bp_type=%d, address=0x%x", type, bp_type, address);
+
     if (bp_type != 0) {  // Only software breakpoints supported
+        LOG(LOG_REMOTE, LOG_WARN)("GDBServer: Non-software breakpoint type %d not supported", bp_type);
         send_packet("");
         return;
     }
 
     bool success;
     if (type == 'Z') {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Setting breakpoint at 0x%x", address);
         success = DEBUG_SetBreakpoint(address);
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: DEBUG_SetBreakpoint returned %s", success ? "true" : "false");
     } else {
+        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Removing breakpoint at 0x%x", address);
         success = DEBUG_RemoveBreakpoint(address);
     }
 
