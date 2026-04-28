@@ -558,7 +558,7 @@ std::string GetCaptureFilePath(const char * type,const char * ext) {
     bool testRead = read_directory_first(dir, tempname, sname, is_directory );
     for ( ; testRead; testRead = read_directory_next(dir, tempname, sname, is_directory) ) {
 		char * test=strstr(tempname,ext);
-		if (!test || strlen(test)!=strlen(ext)) 
+		if (!test || strlen(test)!=strlen(ext))
 			continue;
 		*test=0;
 		if (strncasecmp(tempname,file_start,strlen(file_start))!=0) continue;
@@ -604,7 +604,7 @@ FILE * OpenCaptureFile(const char * type,const char * ext) {
     bool testRead = read_directory_first(dir, tempname, sname, is_directory );
     for ( ; testRead; testRead = read_directory_next(dir, tempname, sname, is_directory) ) {
 		char * test=strstr(tempname,ext);
-		if (!test || strlen(test)!=strlen(ext)) 
+		if (!test || strlen(test)!=strlen(ext))
 			continue;
 		*test=0;
 		if (strncasecmp(tempname,file_start,strlen(file_start))!=0) continue;
@@ -660,7 +660,7 @@ void CAPTURE_VideoEvent(bool pressed) {
 	if (CaptureState & CAPTURE_VIDEO) {
 		/* Close the video */
 		CaptureState &= ~((unsigned int)CAPTURE_VIDEO);
-		LOG_MSG("Stopped capturing video.");	
+		LOG_MSG("Stopped capturing video.");
 
 #if defined(USE_TTF)
 		if (!(CaptureState & CAPTURE_IMAGE) && !(CaptureState & CAPTURE_VIDEO))
@@ -821,29 +821,37 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
 		return;
 	if (width > SCALER_MAXWIDTH)
 		return;
-	
+
 	if (CaptureState & CAPTURE_IMAGE) {
 		png_structp png_ptr;
 		png_infop info_ptr;
 		png_color palette[256];
 
-		CaptureState &= ~((unsigned int)CAPTURE_IMAGE);
 		/* Open the actual file */
 		FILE * fp=OpenCaptureFile("Screenshot",".png");
-		if (!fp) goto skip_shot;
+		if (!fp) {
+			CaptureState &= ~((unsigned int)CAPTURE_IMAGE);
+			goto skip_shot;
+		}
 		/* First try to allocate the png structures */
 		png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL,NULL, NULL);
-		if (!png_ptr) goto skip_shot;
+		if (!png_ptr) {
+			CaptureState &= ~((unsigned int)CAPTURE_IMAGE);
+			fclose(fp);
+			goto skip_shot;
+		}
 		info_ptr = png_create_info_struct(png_ptr);
 		if (!info_ptr) {
 			png_destroy_write_struct(&png_ptr,(png_infopp)NULL);
+			fclose(fp);
+			CaptureState &= ~((unsigned int)CAPTURE_IMAGE);
 			goto skip_shot;
 		}
-	
+
 		/* Finalize the initing of png library */
 		png_init_io(png_ptr, fp);
 		png_set_compression_level(png_ptr,Z_BEST_COMPRESSION);
-		
+
 		/* set other zlib parameters */
 		png_set_compression_mem_level(png_ptr, 8);
 		png_set_compression_strategy(png_ptr,Z_DEFAULT_STRATEGY);
@@ -976,6 +984,7 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
 
 		// Save path for remote debugging before clearing
 		if (pathscr.size()) last_screenshot_path = pathscr;
+		CaptureState &= ~((unsigned int)CAPTURE_IMAGE);
 	}
 	pathscr = "";
 skip_shot:
@@ -1039,7 +1048,7 @@ skip_shot:
 			capture.video.codec = new VideoCodec();
 			if (!capture.video.codec)
 				goto skip_video;
-			if (!capture.video.codec->SetupCompress( (int)width, (int)height)) 
+			if (!capture.video.codec->SetupCompress( (int)width, (int)height))
 				goto skip_video;
 			capture.video.bufSize = capture.video.codec->NeededSize((int)width, (int)height, format);
 			capture.video.buf = malloc( (size_t)capture.video.bufSize );
@@ -2054,7 +2063,7 @@ void CAPTURE_AddMidi(bool sysex, Bitu len, uint8_t * data) {
 		RawMidiAdd( 0xf0 );
 		RawMidiAddNumber((uint32_t)len);
 	}
-	for (Bitu i=0;i<len;i++) 
+	for (Bitu i=0;i<len;i++)
 		RawMidiAdd(data[i]);
 }
 
@@ -2086,7 +2095,7 @@ void CAPTURE_MidiEvent(bool pressed) {
 		CaptureState &= ~((unsigned int)CAPTURE_MIDI);
 		mainMenu.get_item("mapper_caprawmidi").check(false).refresh_item(mainMenu);
 		return;
-	} 
+	}
 	pathmid = "";
 	CaptureState ^= CAPTURE_MIDI;
 	if (CaptureState & CAPTURE_MIDI) {
