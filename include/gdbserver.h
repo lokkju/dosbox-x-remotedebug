@@ -72,6 +72,7 @@ private:
     void handle_read_register(const std::string& cmd);
     void handle_read_registers();
     void handle_write_registers(const std::string& args);
+    void handle_write_register(const std::string& args);
     void handle_read_memory(const std::string& args);
     void handle_write_memory(const std::string& args);
     void handle_breakpoint(const std::string& args);
