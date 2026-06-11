@@ -61,6 +61,7 @@ private:
     bool has_complete_packet() const;
     std::string extract_packet();  // Extract and remove one packet from buffer
     void send_packet(const std::string& packet);
+    bool send_all(const char* data, size_t len);  // Write all bytes, handling partial/EAGAIN
 
     // Handshake
     bool perform_handshake();
