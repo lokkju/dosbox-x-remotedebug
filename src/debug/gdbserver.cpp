@@ -447,8 +447,8 @@ void GDBServer::handle_breakpoint(const std::string& args) {
     int bp_type = std::stoi(args.substr(1, comma1 - 1));
     uint32_t address = std::stoul(args.substr(comma1 + 1, comma2 - comma1 - 1), nullptr, 16);
 
-    if (bp_type != 0) {  // Only software breakpoints supported
-        send_packet("");
+    if (bp_type != 0 && bp_type != 1) {  // Z0=software, Z1=hardware execute: both map to an
+        send_packet("");                 // execution breakpoint. Watchpoints (2/3/4) unsupported.
         return;
     }
 
