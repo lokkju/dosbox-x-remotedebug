@@ -231,25 +231,49 @@ class GDBClient:
             return int("".join(bytes_list), 16)
         return 0
 
+    # Max bytes per `m` request. The reply is 2*N hex chars + framing, so
+    # this keeps each packet well under the stub's advertised PacketSize
+    # (0x3fff = 16383). Chunking also bounds the per-reply buffer on both
+    # ends, avoiding the large-reply failure modes entirely.
+    MAX_READ_CHUNK = 4096
+
     def read_memory(self, addr: Union[int, str], size: int) -> bytes:
         """Read memory from target.
 
         Args:
             addr: Linear address (int) or seg:off string (e.g., "b800:0000")
             size: Number of bytes to read
+
+        Large reads are split into MAX_READ_CHUNK-byte requests so no single
+        GDB reply exceeds the stub's PacketSize.
         """
         if isinstance(addr, str) and ":" in addr:
             # Convert seg:off to linear
             seg, off = addr.split(":")
             addr = (int(seg, 16) << 4) + int(off, 16)
 
-        response = self._send_packet(f"m{addr:x},{size:x}")
+        out = bytearray()
+        remaining = size
+        cur = addr
+        while remaining > 0:
+            chunk = min(remaining, self.MAX_READ_CHUNK)
+            response = self._send_packet(f"m{cur:x},{chunk:x}")
 
-        if response.startswith("E"):
-            raise GDBError(f"Error reading memory: {response}")
+            if response.startswith("E"):
+                raise GDBError(f"Error reading memory at {cur:#x}: {response}")
 
-        # Convert hex string to bytes
-        return bytes.fromhex(response)
+            data = bytes.fromhex(response)
+            # Guard against a short/truncated reply rather than silently
+            # returning fewer bytes than requested.
+            if len(data) != chunk:
+                raise GDBError(
+                    f"Short memory read at {cur:#x}: asked {chunk} bytes, "
+                    f"got {len(data)}")
+            out += data
+            cur += chunk
+            remaining -= chunk
+
+        return bytes(out)
 
     def write_memory(self, addr: Union[int, str], data: bytes) -> bool:
         """Write memory to target.

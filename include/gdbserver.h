@@ -61,6 +61,7 @@ private:
     bool has_complete_packet() const;
     std::string extract_packet();  // Extract and remove one packet from buffer
     void send_packet(const std::string& packet);
+    bool send_all(const char* data, size_t len);  // Write all bytes, handling partial/EAGAIN
 
     // Handshake
     bool perform_handshake();
@@ -72,6 +73,7 @@ private:
     void handle_read_register(const std::string& cmd);
     void handle_read_registers();
     void handle_write_registers(const std::string& args);
+    void handle_write_register(const std::string& args);
     void handle_read_memory(const std::string& args);
     void handle_write_memory(const std::string& args);
     void handle_breakpoint(const std::string& args);

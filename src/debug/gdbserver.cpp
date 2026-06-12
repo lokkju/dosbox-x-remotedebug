@@ -3,6 +3,7 @@
 #if C_REMOTEDEBUG
 
 #include <errno.h>
+#include <poll.h>
 #include "gdbserver.h"
 #include "debug.h"
 #include "logging.h"
@@ -52,12 +53,21 @@ void GDBServer::setup_socket() {
         return;
     }
 
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
-        LOG(LOG_REMOTE, LOG_ERROR)("GDBServer: setsockopt failed: %s", strerror(errno));
+    // SO_REUSEADDR and SO_REUSEPORT are distinct options and must be set
+    // separately. OR-ing them into one optname yields an invalid value
+    // that macOS rejects with ENOPROTOOPT ("Protocol not available").
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        LOG(LOG_REMOTE, LOG_ERROR)("GDBServer: setsockopt(SO_REUSEADDR) failed: %s", strerror(errno));
         close(server_fd);
         server_fd = -1;
         return;
     }
+#ifdef SO_REUSEPORT
+    // Best-effort: not required for correct operation.
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        LOG(LOG_REMOTE, LOG_WARN)("GDBServer: setsockopt(SO_REUSEPORT) failed: %s", strerror(errno));
+    }
+#endif
 
     // Set non-blocking
     int flags = fcntl(server_fd, F_GETFL, 0);
@@ -258,6 +268,39 @@ std::string GDBServer::extract_packet() {
     return packet;
 }
 
+// Write every byte of a buffer to the client socket. client_fd is
+// non-blocking, so a single write() only enqueues what currently fits
+// in the socket send buffer (SO_SNDBUF) and returns short. We must loop,
+// and poll() for writability when the buffer is full, or large replies
+// (e.g. big memory reads) get silently truncated. Returns false if the
+// client could not be fully written to (caller treats it as a drop).
+bool GDBServer::send_all(const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(client_fd, data + sent, len - sent);
+        if (n > 0) {
+            sent += static_cast<size_t>(n);
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Send buffer full: wait until the socket is writable again.
+            struct pollfd pfd;
+            pfd.fd = client_fd;
+            pfd.events = POLLOUT;
+            int pr = ::poll(&pfd, 1, 5000);  // up to 5s for the client to drain
+            if (pr <= 0) {
+                LOG(LOG_REMOTE, LOG_WARN)("GDBServer: send stalled (poll=%d), dropping %zu/%zu bytes",
+                                          pr, len - sent, len);
+                return false;
+            }
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            LOG(LOG_REMOTE, LOG_WARN)("GDBServer: write failed: %s", strerror(errno));
+            return false;
+        }
+    }
+    return true;
+}
+
 void GDBServer::send_packet(const std::string& packet) {
     if (client_fd < 0) return;
 
@@ -268,10 +311,17 @@ void GDBServer::send_packet(const std::string& packet) {
         checksum += static_cast<uint8_t>(c);
     }
 
-    char response[packet.length() + 5];
-    snprintf(response, sizeof(response), "$%s#%02x", packet.c_str(), checksum);
+    // Heap-backed buffer (not a stack VLA): a large memory-read reply can
+    // be hundreds of KB, which would overflow the gdbserver thread stack.
+    char trailer[4];
+    snprintf(trailer, sizeof(trailer), "#%02x", checksum);
+    std::string response;
+    response.reserve(packet.length() + 4);
+    response.push_back('$');
+    response.append(packet);
+    response.append(trailer, 3);
 
-    write(client_fd, response, strlen(response));
+    send_all(response.data(), response.size());
 
     // In non-blocking mode, we don't wait for ACK synchronously
     // The ACK will be in recv_buffer on next poll()
@@ -310,6 +360,8 @@ GDBAction GDBServer::process_command(const std::string& cmd) {
         handle_read_registers();
     } else if (cmd.substr(0, 1) == "G") {
         handle_write_registers(cmd.substr(1));
+    } else if (cmd.substr(0, 1) == "P") {
+        handle_write_register(cmd.substr(1));
     } else if (cmd.substr(0, 1) == "m") {
         handle_read_memory(cmd.substr(1));
     } else if (cmd.substr(0, 1) == "M") {
@@ -393,6 +445,19 @@ void GDBServer::handle_write_registers(const std::string& args) {
         uint32_t value = std::stoul(hex_val, nullptr, 16);
         DEBUG_SetRegister(static_cast<int>(i), swap32(value));
     }
+    send_packet("OK");
+}
+
+void GDBServer::handle_write_register(const std::string& args) {
+    // Format: <reg_num_hex>=<value_hex> (value in target byte order)
+    size_t eq = args.find('=');
+    if (eq == std::string::npos) {
+        send_packet("E01");
+        return;
+    }
+    int reg_num = std::stoi(args.substr(0, eq), nullptr, 16);
+    uint32_t value = std::stoul(args.substr(eq + 1), nullptr, 16);
+    DEBUG_SetRegister(reg_num, swap32(value));
     send_packet("OK");
 }
 
