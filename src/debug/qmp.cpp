@@ -776,11 +776,21 @@ void QMPServer::handle_screendump(const std::string& cmd) {
         return;
     }
 
-    // Give a little extra time for the path to be set
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Get the screenshot path
+    // CAPTURE_IsScreenshotPending() (CaptureState & CAPTURE_IMAGE) is cleared
+    // by CAPTURE_AddImage() the instant PNG encoding *starts*, not when the
+    // file is actually finished and last_screenshot_path is set (see
+    // hardware.cpp) -- so the pending-flag loop above can exit before the
+    // file exists. Poll for the path itself rather than trusting a single
+    // fixed grace sleep; CAPTURE_GetLastScreenshotPath() is cheap and
+    // self-clearing, so repeated calls while still empty are harmless.
+    const int path_timeout_ms = 2000;
+    int path_waited = 0;
     std::string screenshot_path = CAPTURE_GetLastScreenshotPath();
+    while (screenshot_path.empty() && path_waited < path_timeout_ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+        path_waited += poll_interval_ms;
+        screenshot_path = CAPTURE_GetLastScreenshotPath();
+    }
     if (screenshot_path.empty()) {
         send_error("GenericError", "Screenshot capture failed - no file created");
         return;
