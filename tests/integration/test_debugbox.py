@@ -389,7 +389,10 @@ class TestGdbPauseState:
         """GDB halt command should pause CPU execution."""
         # Halt execution
         result = gdb.halt()
-        assert result is not None
+        assert result.startswith("S"), (
+            f"halt returned {result!r}; RawGDB.halt() returns '' on timeout, "
+            f"so anything but a stop reply means the 0x03 interrupt did not "
+            f"stop the guest")
 
         # After halt, we should be able to read registers
         regs = gdb.read_registers()

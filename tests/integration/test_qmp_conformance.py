@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from protocol.qmp import QMPProtocolError
+from protocol.qmp import QMPProtocolError, RawQMP
 
 
 def test_savestate_completes_while_halted_for_gdb(emulator, tmp_path):
@@ -228,6 +228,22 @@ def test_input_send_event_accepts_a_key_release(qmp):
         {"type": "key", "data": {"down": False,
                                  "key": {"type": "qcode", "data": "a"}}},
     ]}) is not None
+
+
+def test_a_client_can_disconnect_and_reconnect(emulator):
+    """Ported from the retired test_qmp_server.py. See the GDB twin: the
+    suite otherwise never exercises a second connection to a live server.
+    """
+    first = RawQMP(port=emulator.qmp_port, timeout=10.0)
+    first.connect()
+    assert first.execute("query-status")["running"] is True
+    first.close()
+
+    second = RawQMP(port=emulator.qmp_port, timeout=10.0)
+    second.connect()
+    assert second.execute("query-status")["running"] is True, (
+        "the server did not accept a second client after the first closed")
+    second.close()
 
 
 if __name__ == "__main__":

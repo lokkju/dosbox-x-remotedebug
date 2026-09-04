@@ -21,6 +21,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from protocol.gdb import RawGDB
+
 CS = 10
 EIP = 8
 
@@ -245,6 +247,26 @@ def test_two_breakpoints_are_independent(gdb):
     assert linear_pc(gdb.read_registers()) == SECOND_LOOP_ADDR
 
     assert gdb.remove_breakpoint(SECOND_LOOP_ADDR) is True
+
+
+def test_a_client_can_disconnect_and_reconnect(emulator):
+    """Ported from the retired test_gdb_server.py. Every other test in this
+    suite makes exactly ONE connection to a freshly spawned emulator, so a
+    detach that failed to return the stub to its accept loop -- or to clear
+    the debug-active state a GDB attach sets -- would leave the whole suite
+    green.
+    """
+    first = RawGDB(port=emulator.gdb_port, timeout=10.0)
+    first.connect()
+    assert "PacketSize=" in first.supported()
+    first.detach()
+    first.close()
+
+    second = RawGDB(port=emulator.gdb_port, timeout=10.0)
+    second.connect()
+    assert "PacketSize=" in second.supported(), (
+        "the stub did not accept a second client after the first detached")
+    second.close()
 
 
 if __name__ == "__main__":
