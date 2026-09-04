@@ -141,3 +141,6 @@ contrib/macos/dosbox-x.plist
 # ignore default dosbox config files (used for manual testing)
 /dosbox-x.conf
 /src/dosbox-x.conf
+
+# Beads issue database: local tooling, not part of the source tree
+.beads/

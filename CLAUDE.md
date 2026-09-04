@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## IMPORTANT: Issue Tracking
 
-**Always use Beads for issue tracking in this project.** Use `/beads:list`, `/beads:create`, `/beads:show`, etc. to manage tasks. Check `/beads:ready` for available work.
+Issue tracking has moved out of this repository. The `.beads/` directory is
+no longer part of the source tree — it is ignored by git and stays local to
+each checkout. No replacement tracker has been chosen yet.
 
 ## Project Overview
 
