@@ -6130,7 +6130,12 @@ uint32_t DEBUG_GetRegister(int reg) {
          case 5: return reg_ebp;
          case 6: return reg_esi;
          case 7: return reg_edi;
-         case 8: return SegPhys(cs)+reg_eip;
+         /* RSP register 8 is EIP -- an offset within CS, not a linear
+          * address. This used to return SegPhys(cs) + reg_eip, which made
+          * real gdb display a wrong $pc and made a g/G round-trip corrupt
+          * EIP, because DEBUG_SetRegister(8) has always written reg_eip.
+          * Clients wanting the linear PC compute cs * 16 + eip. */
+         case 8: return reg_eip;
          case 9: return reg_flags;
          case 10: return SegValue(cs);
          case 11: return SegValue(ss);

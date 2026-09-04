@@ -306,6 +306,8 @@ GDBAction GDBServer::process_command(const std::string& cmd) {
         send_packet("OK");
     } else if (cmd.substr(0, 1) == "p") {
         handle_read_register(cmd);
+    } else if (cmd.substr(0, 1) == "P") {
+        handle_write_register(cmd.substr(1));
     } else if (cmd == "g") {
         handle_read_registers();
     } else if (cmd.substr(0, 1) == "G") {
@@ -393,6 +395,18 @@ void GDBServer::handle_write_registers(const std::string& args) {
         uint32_t value = std::stoul(hex_val, nullptr, 16);
         DEBUG_SetRegister(static_cast<int>(i), swap32(value));
     }
+    send_packet("OK");
+}
+
+void GDBServer::handle_write_register(const std::string& args) {
+    size_t eq = args.find('=');
+    if (eq == std::string::npos) {
+        send_packet("E01");
+        return;
+    }
+    int reg = (int)std::stoul(args.substr(0, eq), nullptr, 16);
+    uint32_t value = (uint32_t)std::stoul(args.substr(eq + 1), nullptr, 16);
+    DEBUG_SetRegister(reg, swap32(value));
     send_packet("OK");
 }
 
