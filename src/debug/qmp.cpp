@@ -705,15 +705,20 @@ void QMPServer::handle_memdump(const std::string& cmd) {
      * the socket thread; savestate, screendump and the input queue all
      * defer to the emulation thread. When the CPU is stopped for debugging
      * no guest code is executing, so memory is quiescent and reading it
-     * here races nothing. When it is running, defer.
+     * here races nothing. Two distinct states qualify and they are tracked by disjoint
+     * flags: DEBUG_IsCpuPausedForDebug() covers the interactive debugger and
+     * a GDB halt, EMULATOR_IsPaused() covers a QMP `stop`, which parks the
+     * emulation thread in PauseDOSBoxLoop. Both leave memory quiescent.
+     * When the guest is actually running, refuse.
      *
      * The deferred path currently reports busy rather than queueing. A
      * request/response marshal with condition-variable signalling is
      * deliberately not built yet: the existing SAVESTATE_* idiom polls at
      * 100ms, which would destroy the 30-60Hz use case this command exists
      * for, and dumping a RUNNING guest at that rate has no measured
-     * consumer. See section 3.1 of the Stage 1 design spec. */
-    if (!DEBUG_IsCpuPausedForDebug()) {
+     * consumer. See section 3.1 of
+     * docs/superpowers/specs/2026-09-03-dosbox-debug-harness-design.md. */
+    if (!DEBUG_IsCpuPausedForDebug() && !EMULATOR_IsPaused()) {
         if (use_temp) unlink(filepath.c_str());
         send_error("GenericError",
                    "memdump requires the CPU to be stopped for debugging; "

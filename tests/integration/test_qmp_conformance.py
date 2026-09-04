@@ -89,5 +89,21 @@ def test_memdump_refuses_while_the_guest_is_running(emulator):
     assert "stopped" in reply["error"]["desc"].lower()
 
 
+def test_memdump_works_after_a_qmp_stop(emulator):
+    """QMP `stop` parks the emulation thread in PauseDOSBoxLoop, so guest
+    memory is quiescent and a direct read is safe -- even though it sets
+    none of the flags DEBUG_IsCpuPausedForDebug() tests. The refusal message
+    tells users to do this, so it has to work.
+    """
+    qmp = emulator.qmp()
+    qmp.execute("stop")
+    try:
+        result = qmp.execute("memdump", {"address": 0xB8000, "size": 16})
+        assert result["size"] == 16
+        assert len(base64.b64decode(result["data"])) == 16
+    finally:
+        qmp.execute("cont")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
