@@ -3,6 +3,14 @@ Simple GDB and QMP client implementations for DOSBox-X integration tests.
 
 This module provides lightweight client implementations that don't rely on
 external dependencies, avoiding issues with third-party libraries.
+
+DEPRECATED. This module is superseded by `dbxdebug`, which carries the same
+protocol clients plus session lifecycle, and is maintained on its own release
+cycle. It survives only until dbxdebug ships a replacement, because
+powerbasic-decompile imports GDBClient and QMPClient from it by path.
+
+New code in this repository should use tests/integration/protocol/ instead.
+See docs/superpowers/specs/2026-09-03-dosbox-debug-harness-design.md.
 """
 
 import json
@@ -21,6 +29,17 @@ class GDBError(Exception):
 class QMPError(Exception):
     """QMP protocol error."""
     pass
+
+
+class PackedAddressError(ValueError):
+    """A breakpoint address that looks like a packed far pointer.
+
+    Z0/z0 now take a LINEAR address. A caller that packed (seg << 16) | off
+    was correct against older builds and is wrong against this one, and the
+    stub answers OK either way -- the breakpoint simply never fires. Real-mode
+    linear addresses stop just past 1 MB including the HMA, so anything at or
+    above 0x110000 is a packed pair rather than an address.
+    """
 
 
 @dataclass
@@ -63,6 +82,19 @@ class Registers:
         """Return register names."""
         return ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
                 "eip", "eflags", "cs", "ss", "ds", "es", "fs", "gs"]
+
+
+REAL_MODE_CEILING = 0x110000
+
+
+def _check_linear(addr: int) -> int:
+    if addr >= REAL_MODE_CEILING:
+        seg, off = addr >> 16, addr & 0xFFFF
+        raise PackedAddressError(
+            f"0x{addr:X} looks like a packed far pointer ({seg:04X}:{off:04X}). "
+            f"Breakpoint addresses are linear: pass {seg * 16 + off:#x} "
+            f"(seg * 16 + off) instead.")
+    return addr
 
 
 class GDBClient:
@@ -277,6 +309,8 @@ class GDBClient:
             seg, off = addr.split(":")
             addr = (int(seg, 16) << 4) + int(off, 16)
 
+        addr = _check_linear(addr)
+
         # Z0 = software breakpoint, kind=1 for x86
         response = self._send_packet(f"Z0,{addr:x},1")
         return response == "OK"
@@ -286,6 +320,8 @@ class GDBClient:
         if isinstance(addr, str) and ":" in addr:
             seg, off = addr.split(":")
             addr = (int(seg, 16) << 4) + int(off, 16)
+
+        addr = _check_linear(addr)
 
         response = self._send_packet(f"z0,{addr:x},1")
         return response == "OK"
