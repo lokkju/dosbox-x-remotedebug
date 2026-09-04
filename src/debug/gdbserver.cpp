@@ -478,7 +478,18 @@ void GDBServer::handle_breakpoint(const std::string& args) {
 
 void GDBServer::handle_query(const std::string& cmd) {
     if (cmd.substr(0, 10) == "Supported:") {
-        send_packet("PacketSize=3fff;swbreak+;hwbreak+;vContSupported+;QStartNoAckMode+");
+        /* Two vendor features naming the two semantics this build fixed.
+         * dosbox-x-linear-bp+ : Z0/z0 take a LINEAR address, as the
+         *   protocol specifies, not the packed far pointer older builds
+         *   expected. Needed because Z0 answers OK under either reading.
+         * dosbox-x-eip-offset+ : register 8 is EIP, an offset within CS,
+         *   not SegPhys(cs)+reg_eip. Needed because either interpretation
+         *   yields a plausible-looking number.
+         * Real gdb ignores features it does not recognise, so both stay
+         * RSP-legal. */
+        send_packet("PacketSize=3fff;swbreak+;hwbreak+;vContSupported+;"
+                    "QStartNoAckMode+;dosbox-x-linear-bp+;"
+                    "dosbox-x-eip-offset+");
     } else if (cmd.substr(0, 11) == "fThreadInfo") {
         send_packet("m1");
     } else if (cmd.substr(0, 11) == "sThreadInfo") {

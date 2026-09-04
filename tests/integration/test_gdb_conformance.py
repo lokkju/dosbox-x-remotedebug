@@ -130,5 +130,28 @@ def test_removing_a_breakpoint_lets_execution_continue(gdb):
         "execution stopped again after the breakpoint was removed")
 
 
+def test_qsupported_advertises_linear_breakpoints(gdb):
+    """Z0 answers OK whichever way it reads the address, so a client cannot
+    detect the semantics by probing. It has to be advertised."""
+    features = gdb.supported()
+    assert "dosbox-x-linear-bp+" in features, (
+        f"qSupported did not advertise linear breakpoints: {features!r}")
+
+
+def test_qsupported_advertises_eip_as_an_offset(gdb):
+    """Register 8 returns a plausible number under either interpretation, so
+    a client that guesses wrong computes a wrong PC and never finds out."""
+    features = gdb.supported()
+    assert "dosbox-x-eip-offset+" in features, (
+        f"qSupported did not advertise EIP semantics: {features!r}")
+
+
+def test_qsupported_still_advertises_the_stock_features(gdb):
+    features = gdb.supported()
+    for feature in ("PacketSize=", "swbreak+", "hwbreak+",
+                    "vContSupported+", "QStartNoAckMode+"):
+        assert feature in features, f"lost {feature} from qSupported"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
