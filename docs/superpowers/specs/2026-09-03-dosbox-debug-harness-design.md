@@ -228,19 +228,30 @@ Nothing in this repo depends on it after §3.2; `launcher.py` covers CI.
 
 ### 3.3 Upstream PR
 
-The remote-debug subsystem is fork-local, added in fork commit `2cc007655`
-("first pass at adding a gdb server"). `master` has none of it: no
+This fork exists to add remote debugging to DOSBox-X. The subsystem was
+introduced in fork commit `2cc007655` ("first pass at adding a gdb server")
+and has not been accepted upstream, so `master` still has none of it: no
 `src/debug/gdbserver.cpp`, `src/debug/qmp.cpp`, `include/gdbserver.h`,
-`include/qmp.h`, `docs/REMOTEDEBUG.md`, or `tests/integration/`, and no
-`C_REMOTEDEBUG` build flag. Upstream has no GDB server for Stage 1 to fix.
+`include/qmp.h`, `docs/REMOTEDEBUG.md`, `tests/integration/`, or
+`C_REMOTEDEBUG` build flag.
 
-That changes what "the PR" would mean. Stage 1's fixes -- the protocol-
-conformance bug plus two threading bugs, and the tests that pin them -- are
-corrections to a fork-local subsystem, not a patch against something
-upstream already has. Contributing them upstream would mean contributing the
-entire subsystem: roughly 7,000 lines including the QMP and GDB servers, not
-a small conformance patch. Whether that contribution is worth proposing, and
-in what form, is an open framing decision, not one this stage settles.
+The PR is therefore the subsystem itself -- roughly 7,000 lines including the
+QMP and GDB servers -- and Stage 1 is not a separate PR against it. Stage 1's
+value is that it makes that proposal defensible: a reviewer reading
+`gdbserver.cpp` for the first time now finds a stub that conforms to the GDB
+remote serial protocol on breakpoint and register addressing, does not race
+the emulation thread on `memdump`, services pending work while halted, and
+arrives with a conformance suite that pins each of those properties.
+
+The practical consequence for scope: **the whole subsystem is the review
+surface, not just this stage's diff.** Defects anywhere in it are fair game
+for a maintainer, so items this stage deferred as "pre-existing" -- the
+unguarded `std::stoul` calls on the emulation thread, `P` answering `OK` for
+an out-of-range register, `Z0` answering `OK` in protected mode where the
+breakpoint cannot fire, `BPLIST`'s address formatting, and the inconsistency
+between `memdump` refusing an incoherent result while `system_reset` returns
+one -- are worth closing before the proposal goes out, even though none of
+them is a regression this stage introduced.
 
 ## 4. Stage 2 — `dbxdebug`
 
