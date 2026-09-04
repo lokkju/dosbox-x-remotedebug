@@ -47,7 +47,7 @@ class RawQMP:
 
     def _recv_json(self) -> dict:
         deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        while True:
             if b"\n" in self._buf:
                 line, self._buf = self._buf.split(b"\n", 1)
                 line = line.strip()
@@ -58,7 +58,14 @@ class RawQMP:
                 except json.JSONDecodeError as exc:
                     raise QMPProtocolError(
                         f"not JSON: {line!r}") from exc
-            chunk = self._sock.recv(65536)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self._sock.settimeout(remaining)
+            try:
+                chunk = self._sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                break
             if not chunk:
                 raise QMPProtocolError("connection closed")
             self._buf += chunk

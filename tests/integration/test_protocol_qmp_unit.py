@@ -76,5 +76,36 @@ def test_omits_the_arguments_key_when_there_are_none():
     assert json.loads(sock.written.decode()) == {"execute": "query-status"}
 
 
+class TimingOutSocket:
+    """A socket that accepts writes and never answers."""
+
+    def __init__(self):
+        self.written = b""
+
+    def sendall(self, data: bytes) -> None:
+        self.written += data
+
+    def recv(self, n: int) -> bytes:
+        raise TimeoutError("timed out")
+
+    def settimeout(self, _t) -> None:
+        pass
+
+    def gettimeout(self):
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+def test_an_unresponsive_server_raises_a_protocol_error_not_a_socket_error():
+    """A bare socket.timeout escaping _recv_json makes every caller handle
+    two unrelated exception types for the same condition."""
+    client = RawQMP(timeout=0.1)
+    client._sock = TimingOutSocket()
+    with pytest.raises(QMPProtocolError, match="timed out"):
+        client.execute("query-status")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
