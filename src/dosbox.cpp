@@ -467,6 +467,14 @@ static Bitu Normal_Loop(void) {
 #if C_REMOTEDEBUG
             // Check for GDB step/continue requests from the GDB server thread
             if (DEBUG_CheckGDBStep()) {
+                /* Halted for GDB, or a step just completed. The drains below
+                 * are unreachable on this path, so pending QMP work has to be
+                 * serviced here or it never runs while stopped at a
+                 * breakpoint: savestate waits out its timeout and queued
+                 * keystrokes are dropped. */
+                SAVESTATE_CheckPendingRequest();
+                EMULATOR_CheckPendingControl();
+                QMP_ProcessPendingInputEvents();
                 // Step was executed, return to allow loop to be called again
                 return 0;
             }
