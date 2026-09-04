@@ -105,5 +105,75 @@ def test_memdump_works_after_a_qmp_stop(emulator):
         qmp.execute("cont")
 
 
+def test_query_commands_lists_every_dispatched_command(qmp):
+    """Guards against a command being added to the dispatch at qmp.cpp:404
+    without being announced, which makes it undiscoverable."""
+    listed = {entry["name"] for entry in qmp.execute("query-commands")}
+    expected = {
+        "qmp_capabilities", "send-key", "input-send-event", "query-commands",
+        "memdump", "screendump", "savestate", "loadstate", "stop", "cont",
+        "system_reset", "query-status", "debug-break-on-exec",
+    }
+    missing = expected - listed
+    assert not missing, f"query-commands omits {sorted(missing)}"
+
+
+def test_send_key_accepts_a_qcode(qmp):
+    assert qmp.execute("send-key",
+                       {"keys": [{"type": "qcode", "data": "a"}]}) is not None
+
+
+def test_input_send_event_accepts_a_key_event(qmp):
+    assert qmp.execute("input-send-event", {"events": [
+        {"type": "key", "data": {"down": True,
+                                 "key": {"type": "qcode", "data": "a"}}},
+    ]}) is not None
+
+
+def test_stop_then_cont_round_trips(qmp):
+    qmp.execute("stop")
+    assert qmp.execute("query-status")["running"] is False
+    qmp.execute("cont")
+    assert qmp.execute("query-status")["running"] is True
+
+
+def test_screendump_returns_png_data(qmp, tmp_path):
+    result = qmp.execute("screendump", {"file": str(tmp_path / "shot.png")})
+    assert result["format"] == "png"
+    assert result["size"] > 0
+
+
+def test_savestate_then_loadstate_round_trips(qmp, tmp_path):
+    """loadstate has no dispatch coverage unless a save exists first --
+    write one instead of skipping the loadstate command entirely."""
+    target = tmp_path / "roundtrip.sav"
+
+    save_result = qmp.execute("savestate", {"file": str(target)})
+    assert save_result["file"] == str(target)
+    assert target.exists()
+
+    load_result = qmp.execute("loadstate", {"file": str(target)})
+    assert load_result["file"] == str(target)
+
+
+def test_system_reset_is_acknowledged(qmp):
+    """system_reset replies immediately and reboots the guest
+    asynchronously on the main thread. Assert the ack, then confirm the
+    server (this test's own emulator, torn down by the fixture afterward)
+    still answers commands rather than leaving the socket wedged."""
+    assert qmp.execute("system_reset") is not None
+    assert qmp.execute("query-status") is not None
+
+
+def test_debug_break_on_exec_toggles(qmp):
+    assert qmp.execute("debug-break-on-exec", {"enabled": True}) is not None
+    assert qmp.execute("debug-break-on-exec", {"enabled": False}) is not None
+
+
+def test_an_unknown_command_is_an_error_not_a_hang(qmp):
+    reply = qmp.execute_raw("no-such-command")
+    assert "error" in reply
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
