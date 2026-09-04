@@ -1829,6 +1829,7 @@ git commit -m "test: pin the gdbserver/qmpserver port option names"
 - Modify: `tests/integration/run_all.py`
 - Rewrite: `tests/integration/test_video_tools.py`
 - Modify: `tests/integration/test_debugbox.py`
+- Delete: `tests/integration/test_gdb_server.py`, `tests/integration/test_qmp_server.py`
 - Modify: `tests/integration/README.md`
 
 **Interfaces:**
@@ -1926,6 +1927,32 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 ```
 
+- [ ] **Step 3b: Retire the two legacy protocol suites**
+
+`tests/integration/test_gdb_server.py` (23 tests) and `tests/integration/test_qmp_server.py`
+(27 tests) are the pre-conformance protocol suites. Both import from `dosbox_debug`, both
+define their own module-scoped `gdb`/`qmp` fixtures that connect to the hardcoded ports 2159
+and 4444, and both call `pytest.skip` for every test when nothing is listening there. In
+practice that is always: the new suite starts its own emulator on dynamic ports and never
+binds the stock ones. **They contribute zero coverage today while presenting as fifty passing-
+or-skipping tests** — the same silent-failure shape this whole branch exists to remove. They
+are also exactly the files `test_gdb_conformance.py` and `test_qmp_conformance.py` were written
+to replace, and they import a module Stage 2 deletes.
+
+Retire them, in this order:
+
+1. Read both files and list every distinct behaviour they assert.
+2. For each, decide whether the conformance suite already covers it. `test_gdb_conformance.py`
+   covers the register interface, the `P` packet, linear breakpoints and `qSupported`;
+   `test_qmp_conformance.py` covers the halted drain, `query-status`, `memdump`, the dispatch
+   surface and the key/event commands.
+3. Port any behaviour that is NOT covered into the matching conformance file, written against
+   the `emulator`/`gdb`/`qmp` fixtures rather than the hardcoded ports. Do not port a test whose
+   only content is "the server accepts a connection" — the fixtures prove that on every test.
+4. `git rm` both files.
+5. Record in your report which behaviours you ported and which you judged already covered. That
+   list is the evidence that deleting fifty tests lost nothing.
+
 - [ ] **Step 4: Rebase test_debugbox.py onto the fixtures**
 
 `test_debugbox.py:31` imports `DOSBoxInstance, GDBClient, QMPClient` from `dosbox_debug`. Replace that import and any `DOSBoxInstance(...)` construction with the `emulator`, `gdb` and `qmp` fixtures from `conftest.py`, and replace `dosbox_debug` method calls with their `RawGDB`/`RawQMP` equivalents: `read_registers()` now returns a list of 16 ints rather than a `Registers` object, so index it (register 8 is EIP, 10 is CS, 12 is DS; the linear PC is `regs[10] * 16 + regs[8]`). Leave the DEBUGBOX behavior each test asserts unchanged.
@@ -1942,7 +1969,7 @@ Expected: PASS across `test_protocol_gdb_unit.py`, `test_protocol_qmp_unit.py`, 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add tests/integration/run_all.py tests/integration/test_video_tools.py tests/integration/test_debugbox.py tests/integration/README.md
+git add -A tests/integration/
 git commit -F - <<'EOF'
 test: rebase behavioral tests onto the conformance harness
 
@@ -1957,6 +1984,12 @@ isolated emulator instead of requiring one to be running on 2159/4444.
 run_all.py declared a dbxdebug>=0.2.1 dependency that nothing imported.
 dbxdebug is Polyform Shield 1.0.0 and this project is GPLv2, so it
 cannot be a test dependency here even unused.
+
+test_gdb_server.py and test_qmp_server.py are removed. They are the
+suites the conformance tests replace, they connect to the hardcoded
+2159/4444 and so skipped all fifty of their tests in every run, and they
+import a module that is going away. Behaviours they covered that the
+conformance suite did not are ported first.
 EOF
 ```
 

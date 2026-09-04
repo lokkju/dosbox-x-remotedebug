@@ -177,6 +177,11 @@ defensible, and stops it duplicating `dbxdebug`.
   listener on `N` and not on 2159. This is F4 turned into a test.
 - Existing behavioral tests (`test_debugbox.py`, `test_video_tools.py`) stay,
   rebased onto `launcher.py`.
+- `test_gdb_server.py` and `test_qmp_server.py` are deleted. They are the
+  protocol suites the conformance tests replace; they connect to the hardcoded
+  2159/4444 and therefore `pytest.skip` all fifty of their tests on every run,
+  contributing no coverage while looking like fifty tests. Any behaviour of
+  theirs the conformance suite does not already assert is ported before they go.
 
 ### 3.4 `dosbox_debug.py` survives Stage 1
 
