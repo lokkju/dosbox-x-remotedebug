@@ -153,5 +153,99 @@ def test_qsupported_still_advertises_the_stock_features(gdb):
         assert feature in features, f"lost {feature} from qSupported"
 
 
+# -- ported from the retired test_gdb_server.py --------------------------
+#
+# The tests below cover behaviour test_gdb_server.py asserted that the
+# suite above does not: QStartNoAckMode, the `p` single-register packet,
+# zero-length and odd-address/large memory reads, single-step, and
+# breakpoints that are actually verified to fire independently rather than
+# merely accepted. See task-11-report.md for the full retirement audit.
+
+def test_qstartnoackmode_is_accepted(gdb):
+    assert gdb.start_no_ack() is True
+
+
+def test_p_packet_reads_a_single_register_matching_the_bulk_read(gdb):
+    """`p` (single-register read) has no RawGDB wrapper -- send it directly.
+    Every register must agree with what `g` (bulk read) reports."""
+    gdb.halt()
+    bulk = gdb.read_registers()
+    for i in range(16):
+        reply = gdb.send(f"p{i:x}")
+        value = int.from_bytes(bytes.fromhex(reply), "little")
+        assert value == bulk[i], (
+            f"p{i:x} returned 0x{value:X}, bulk read said 0x{bulk[i]:X}")
+
+
+def test_memory_read_returns_the_exact_length_requested(gdb):
+    """Covers both size variation and an odd (unaligned) start address --
+    x86 real mode has no alignment requirement, so both are one behaviour:
+    `m` must return exactly the number of bytes asked for."""
+    for size in (1, 2, 4, 7, 8, 16, 64, 256, 1024, 8192):
+        data = gdb.read_memory(0xB8001, size)
+        assert len(data) == size, f"asked for {size} bytes, got {len(data)}"
+
+
+def test_memory_read_of_zero_length_returns_empty(gdb):
+    assert gdb.read_memory(0xB8000, 0) == b""
+
+
+def test_single_step_advances_the_program_counter(gdb):
+    """`s` must execute at least one instruction and report SIGTRAP each
+    time -- a code path `c` + breakpoint never exercises. The first step
+    out of a freshly-written CS:EIP may cross more than one NOP, so this
+    checks forward progress on every step rather than a fixed delta."""
+    addr = 0x30100
+    gdb.halt()
+    assert gdb.write_memory(addr, b"\x90" * 6) is True
+    assert gdb.write_register(10, addr >> 4) is True   # CS
+    assert gdb.write_register(8, addr & 0xF) is True   # EIP
+
+    last = linear_pc(gdb.read_registers())
+    start = last
+    for _ in range(5):
+        gdb.step()
+        stop = gdb.wait_for_stop(timeout=5.0)
+        assert stop.startswith("S05"), f"step did not report SIGTRAP: {stop!r}"
+        pc = linear_pc(gdb.read_registers())
+        assert pc > last, f"step did not advance the PC (stuck at 0x{pc:X})"
+        last = pc
+    assert last > start
+
+
+SECOND_LOOP_ADDR = 0x30010
+
+
+def test_two_breakpoints_are_independent(gdb):
+    """The legacy suite set and removed a batch of breakpoints without ever
+    checking one fired. Verify the actual effect: two breakpoints each stop
+    execution at their own address, and clearing one leaves the other armed.
+    """
+    gdb.halt()
+    for addr in (LOOP_ADDR, SECOND_LOOP_ADDR):
+        assert gdb.write_memory(addr, JMP_SELF) is True
+        gdb.remove_breakpoint(addr)
+    assert gdb.set_breakpoint(LOOP_ADDR) is True
+    assert gdb.set_breakpoint(SECOND_LOOP_ADDR) is True
+
+    gdb.write_register(10, LOOP_ADDR >> 4)
+    gdb.write_register(8, LOOP_ADDR & 0xF)
+    gdb.cont()
+    stop = gdb.wait_for_stop(timeout=15.0)
+    assert stop.startswith("S05")
+    assert linear_pc(gdb.read_registers()) == LOOP_ADDR
+
+    assert gdb.remove_breakpoint(LOOP_ADDR) is True
+    gdb.write_register(10, SECOND_LOOP_ADDR >> 4)
+    gdb.write_register(8, SECOND_LOOP_ADDR & 0xF)
+    gdb.cont()
+    stop2 = gdb.wait_for_stop(timeout=15.0)
+    assert stop2.startswith("S05"), (
+        "the second breakpoint never fired after the first was removed")
+    assert linear_pc(gdb.read_registers()) == SECOND_LOOP_ADDR
+
+    assert gdb.remove_breakpoint(SECOND_LOOP_ADDR) is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -13,23 +13,30 @@ These tests verify that DEBUGBOX and the GDB server work together correctly:
 - GDB client can connect and see the paused state
 - Registers reflect the program's entry point
 
-These tests use DOSBoxInstance to automatically start/stop DOSBox-X.
+Each test gets its own emulator via the `emulator`/`gdb`/`qmp` fixtures in
+conftest.py rather than a shared instance on the hardcoded 2159/4444 ports.
+
+Register 8 is EIP, an offset within CS -- not a linear address. The linear
+PC is registers[10] * 16 + registers[8]. See protocol/gdb.py.
 
 Run with:
     uv run pytest tests/integration/test_debugbox.py -v
-
-Or:
-    uv run tests/integration/test_debugbox.py
 """
 
-import os
 import sys
 import time
 from pathlib import Path
 
 import pytest
-from dosbox_debug import DOSBoxInstance, GDBClient, QMPClient
 
+sys.path.insert(0, str(Path(__file__).parent))
+
+from launcher import Emulator
+
+EIP = 8
+CS = 10
+
+TEXT_VRAM = 0xB8000
 
 # Test assets directory (relative to this file)
 TEST_ASSETS_DIR = Path(__file__).parent / "assets"
@@ -65,27 +72,104 @@ def create_test_com_file():
         return None
 
 
-@pytest.fixture(scope="module")
-def dosbox():
-    """Start DOSBox-X for the test module."""
-    with DOSBoxInstance() as dbx:
-        # Wait for boot
-        dbx.continue_()
-        time.sleep(2.0)
-        yield dbx
+# -- local plumbing: typing text and reading the screen via raw clients --
+#
+# dosbox_debug.py's type_text/screen_line convenience is exactly what
+# belongs in dbxdebug (Polyform Shield), not here. What DEBUGBOX testing
+# needs is minimal: enough of a qcode table to type a DOS command line, and
+# enough of a screen reader to confirm it landed. See test_video_tools.py
+# for the sibling read_screen() this mirrors.
+
+_SPECIAL_KEYS = {" ": "spc", "\r": "ret", "\n": "ret", ".": "dot"}
+_SHIFTED_KEYS = {":": "semicolon"}
+
+
+def _type_text(qmp, text: str, delay: float = 0.1) -> None:
+    for char in text:
+        if char in _SPECIAL_KEYS:
+            keys = [_SPECIAL_KEYS[char]]
+        elif char in _SHIFTED_KEYS:
+            keys = ["shift", _SHIFTED_KEYS[char]]
+        elif char.isupper():
+            keys = ["shift", char.lower()]
+        elif char.isalnum():
+            keys = [char.lower()]
+        else:
+            continue
+        qmp.execute("send-key",
+                    {"keys": [{"type": "qcode", "data": k} for k in keys]})
+        time.sleep(delay)
+
+
+def _screen_text(gdb, width: int = 80, height: int = 25) -> list:
+    raw = gdb.read_memory(TEXT_VRAM, width * height * 2)
+    lines = []
+    for row in range(height):
+        chars = []
+        for col in range(width):
+            offset = (row * width + col) * 2
+            byte = raw[offset]
+            chars.append(chr(byte) if 32 <= byte < 127 else " ")
+        lines.append("".join(chars).rstrip())
+    return lines
+
+
+def _drain_stop(gdb, timeout: float = 0.3) -> None:
+    """Consume one extra queued stop-reply packet, if any.
+
+    DEBUGBOX's break-on-exec emits two stop notifications in quick
+    succession once the guest reaches the loaded program's entry point.
+    halt() only consumes one; without this, the next command's reply gets
+    desynced by the packet left behind.
+    """
+    gdb.wait_for_stop(timeout=timeout)
+
+
+def _run_command(gdb, qmp, command: str, wait_after: float = 0.5,
+                  verify: bool = True) -> None:
+    """Type a DOS command and press Enter.
+
+    Raises RuntimeError if verify=True and the command never appeared on
+    screen before Enter was pressed. Checks the whole screen rather than a
+    fixed row: unlike the DOSBoxInstance this file used to drive, a freshly
+    booted emulator has not scrolled its welcome banner off screen, so the
+    prompt is not reliably on any particular line.
+    """
+    _type_text(qmp, command)
+
+    if verify:
+        time.sleep(0.2)
+        gdb.halt()
+        time.sleep(0.1)
+        lines = _screen_text(gdb)
+        gdb.cont()
+        time.sleep(0.1)
+
+        if not any(command.upper() in line.upper() for line in lines):
+            raise RuntimeError(
+                f"Command '{command}' not visible on screen. "
+                f"Screen shows: {lines!r}")
+
+    _type_text(qmp, "\r")
+    time.sleep(wait_after)
 
 
 @pytest.fixture
-def ensure_running(dosbox):
-    """Ensure the emulator is running (not paused) before the test."""
-    try:
-        status = dosbox.query_status().get('return', {})
-        if status.get('status') == 'paused' or not status.get('running', True):
-            dosbox.continue_()
-            time.sleep(0.2)
-    except Exception:
-        pass
-    yield
+def emulator_with_test_drive():
+    """An emulator with the assets directory mounted as T:, for the
+    DEBUGBOX-entry-point tests that need to run a COM file from disk."""
+    with Emulator(mounts={"t": str(TEST_ASSETS_DIR)}) as emu:
+        yield emu
+
+
+@pytest.fixture
+def gdb_t(emulator_with_test_drive):
+    return emulator_with_test_drive.gdb()
+
+
+@pytest.fixture
+def qmp_t(emulator_with_test_drive):
+    return emulator_with_test_drive.qmp()
 
 
 # =============================================================================
@@ -95,25 +179,22 @@ def ensure_running(dosbox):
 class TestDebugboxBasic:
     """Test basic DEBUGBOX functionality."""
 
-    def test_debugbox_without_args_pauses(self, dosbox, ensure_running):
+    def test_debugbox_without_args_pauses(self, gdb, qmp):
         """DEBUGBOX without arguments should pause in debugger mode."""
-        # Make sure running
-        dosbox.continue_()
-        time.sleep(0.3)
-
         # Type DEBUGBOX command without arguments
-        dosbox.run_command("DEBUGBOX", wait_after=0.5)
+        _run_command(gdb, qmp, "DEBUGBOX", wait_after=0.5)
 
         # Halt to ensure we're stopped
-        dosbox.halt()
+        gdb.halt()
+        _drain_stop(gdb)
         time.sleep(0.2)
 
         # Verify we can read registers (confirms pause state)
-        regs = dosbox.gdb.read_registers()
+        regs = gdb.read_registers()
         assert regs is not None, "Could not read registers during DEBUGBOX"
 
         # Check if emulator is paused via query-status
-        status = dosbox.query_status().get('return', {})
+        status = qmp.execute("query-status")
 
         # Debugger mode should pause execution
         is_paused = status.get('status') == 'paused' or not status.get('running', True)
@@ -123,25 +204,28 @@ class TestDebugboxBasic:
 class TestDebugboxWithGdb:
     """Test DEBUGBOX integration with GDB server."""
 
-    def test_gdb_can_connect_during_debugbox(self, dosbox):
+    def test_gdb_can_connect_during_debugbox(self, gdb):
         """GDB should be able to connect while DEBUGBOX is active."""
         # Should be able to read registers
-        regs = dosbox.gdb.read_registers()
+        regs = gdb.read_registers()
         assert regs is not None
-        assert hasattr(regs, 'eip')
+        # regs is a plain list of 16 ints now, not a Registers object;
+        # index EIP (8) rather than probing an attribute.
+        assert len(regs) == 16
 
-    def test_gdb_sees_pause_after_breakpoint(self, dosbox):
+    def test_gdb_sees_pause_after_breakpoint(self, gdb):
         """GDB should see the CPU paused when breakpoint is hit."""
         # Read initial EIP
-        regs = dosbox.gdb.read_registers()
-        initial_eip = regs.eip
+        regs = gdb.read_registers()
+        initial_eip = regs[EIP]
 
         # Perform a step - this should pause and return
-        result = dosbox.gdb.step()
-        assert result is not None
+        gdb.step()
+        result = gdb.wait_for_stop(timeout=5.0)
+        assert result != "", "step produced no stop reply"
 
         # Read registers after step
-        regs_after = dosbox.gdb.read_registers()
+        regs_after = gdb.read_registers()
         assert regs_after is not None
 
 
@@ -166,46 +250,43 @@ class TestDebugboxEntryPoint:
 class TestDebugboxEntryPointFull:
     """Full end-to-end test for DEBUGBOX entry point."""
 
-    def test_debugbox_breaks_at_com_entry(self, dosbox, ensure_running):
+    def test_debugbox_breaks_at_com_entry(self, gdb_t, qmp_t):
         """Verify DEBUGBOX pauses at COM file entry point."""
         # Ensure test COM file exists
         com_path = create_test_com_file()
         if com_path is None:
             pytest.skip("Could not create test COM file")
 
-        # Make sure running
-        dosbox.continue_()
-        time.sleep(0.3)
-
         # Change to test drive
-        dosbox.run_command("T:", wait_after=0.3)
+        _run_command(gdb_t, qmp_t, "T:", wait_after=0.3)
 
         # Run DEBUGBOX with test program
-        dosbox.run_command("DEBUGBOX DBXTEST.COM", wait_after=1.0)
+        _run_command(gdb_t, qmp_t, "DEBUGBOX DBXTEST.COM", wait_after=1.0)
 
         # Halt to ensure we're stopped
-        dosbox.halt()
+        gdb_t.halt()
+        _drain_stop(gdb_t)
         time.sleep(0.2)
 
         # Read registers
-        regs = dosbox.gdb.read_registers()
+        regs = gdb_t.read_registers()
         assert regs is not None, "Failed to read registers"
 
-        eip = regs.eip
-        cs = regs.cs
-
-        # For COM files, EIP should have offset 0x100 within its segment
-        eip_offset = eip - (cs * 16)
+        # Register 8 (EIP) is already an offset within CS -- not a linear
+        # address to subtract cs*16 from, the way the old Registers object
+        # (which reported SegPhys(cs)+reg_eip) required.
+        eip_offset = regs[EIP]
+        cs = regs[CS]
 
         # The program should be at entry point 0x100 (NOP instruction)
         assert eip_offset in (0x100, 0x101, 0x102), (
             f"Expected EIP offset ~0x100 for COM entry point, "
-            f"got 0x{eip_offset:04X} (full EIP: 0x{eip:08X}, CS: 0x{cs:04X})"
+            f"got 0x{eip_offset:04X} (CS: 0x{cs:04X})"
         )
 
         # Read memory at entry point to verify it's our test program
-        entry_addr = (cs << 4) + 0x100 if cs else eip - eip_offset + 0x100
-        mem = dosbox.gdb.read_memory(entry_addr, 7)
+        entry_addr = (cs << 4) + 0x100
+        mem = gdb_t.read_memory(entry_addr, 7)
 
         expected_bytes = bytes([0x90, 0x90, 0xB8, 0x00, 0x4C, 0xCD, 0x21])
         assert mem == expected_bytes, (
@@ -214,33 +295,32 @@ class TestDebugboxEntryPointFull:
         )
 
         # Continue execution to clean up
-        dosbox.gdb.step()
-        dosbox.gdb.step()
+        gdb_t.step()
+        gdb_t.wait_for_stop(timeout=2.0)
+        gdb_t.step()
+        gdb_t.wait_for_stop(timeout=2.0)
 
-    def test_debugbox_paused_state_visible_via_qmp(self, dosbox, ensure_running):
+    def test_debugbox_paused_state_visible_via_qmp(self, gdb_t, qmp_t):
         """Verify DEBUGBOX pause state is visible via QMP query-status."""
         # Ensure test COM file exists
         com_path = create_test_com_file()
         if com_path is None:
             pytest.skip("Could not create test COM file")
 
-        # Make sure running
-        dosbox.continue_()
-        time.sleep(0.3)
-
         # Change to test drive (verify=False to avoid halt/continue overhead)
-        dosbox.run_command("T:", wait_after=0.5, verify=False)
+        _run_command(gdb_t, qmp_t, "T:", wait_after=0.5, verify=False)
 
         # Run DEBUGBOX with test program (verify=False for reliability)
-        dosbox.run_command("DEBUGBOX DBXTEST.COM", wait_after=1.5, verify=False)
+        _run_command(gdb_t, qmp_t, "DEBUGBOX DBXTEST.COM", wait_after=1.5,
+                     verify=False)
 
         # Halt to ensure we're stopped
-        dosbox.halt()
+        gdb_t.halt()
+        _drain_stop(gdb_t)
         time.sleep(0.2)
 
         # Query status - should show debug pause state
-        response = dosbox.query_status()
-        status = response.get('return', {})
+        status = qmp_t.execute("query-status")
 
         # Overall status should be paused
         assert status.get('status') == 'paused', f"Expected 'paused', got {status.get('status')}"
@@ -255,10 +335,9 @@ class TestDebugboxEntryPointFull:
 class TestQueryStatus:
     """Test QMP query-status command for debugging state."""
 
-    def test_query_status_returns_valid_response(self, dosbox):
+    def test_query_status_returns_valid_response(self, qmp):
         """query-status should return valid running/paused state with debug info."""
-        response = dosbox.query_status()
-        status = response.get('return', {})
+        status = qmp.execute("query-status")
 
         # Status should have required fields
         assert 'status' in status, "Missing 'status' field"
@@ -276,35 +355,29 @@ class TestQueryStatus:
         assert 'active' in debug, "Missing 'debug.active' field"
         assert 'paused' in debug, "Missing 'debug.paused' field"
 
-    def test_stop_and_cont_commands(self, dosbox):
+    def test_stop_and_cont_commands(self, gdb, qmp):
         """stop and cont commands should control emulator pause state."""
-        # First ensure we're running
-        dosbox.continue_()
-        time.sleep(0.3)
-
         # Stop the emulator
-        dosbox.qmp.stop()
+        qmp.execute("stop")
         time.sleep(0.2)
 
         # Verify paused
-        response = dosbox.query_status()
-        status = response.get('return', {})
+        status = qmp.execute("query-status")
 
         assert status.get('status') == 'paused', f"Expected 'paused', got {status.get('status')}"
         # Note: emulator-paused may be False if GDB is connected and pausing
         # The important thing is that status='paused' and running=False
 
         # Resume
-        dosbox.qmp.cont()
+        qmp.execute("cont")
         time.sleep(0.2)
 
         # Also continue GDB to fully resume
-        dosbox.continue_()
+        gdb.cont()
         time.sleep(0.2)
 
         # Verify running
-        response = dosbox.query_status()
-        status = response.get('return', {})
+        status = qmp.execute("query-status")
 
         assert status.get('status') == 'running', f"Expected 'running', got {status.get('status')}"
 
@@ -312,136 +385,140 @@ class TestQueryStatus:
 class TestGdbPauseState:
     """Test GDB server pause state detection."""
 
-    def test_gdb_halt_pauses_execution(self, dosbox):
+    def test_gdb_halt_pauses_execution(self, gdb):
         """GDB halt command should pause CPU execution."""
         # Halt execution
-        result = dosbox.halt()
+        result = gdb.halt()
         assert result is not None
 
         # After halt, we should be able to read registers
-        regs = dosbox.gdb.read_registers()
+        regs = gdb.read_registers()
         assert regs is not None
-        assert hasattr(regs, 'eip')
+        assert len(regs) == 16
 
-    def test_gdb_pause_visible_via_qmp(self, dosbox):
+    def test_gdb_pause_visible_via_qmp(self, gdb, qmp):
         """GDB step/halt should be visible via QMP query-status."""
         # Step to pause for GDB
-        dosbox.gdb.step()
+        gdb.step()
+        gdb.wait_for_stop(timeout=5.0)
 
         # Check via QMP
-        response = dosbox.query_status()
-        status = response.get('return', {})
+        status = qmp.execute("query-status")
 
         # Should show debug active and paused
         debug = status.get('debug', {})
         assert debug.get('active') is True, "Expected debug.active=true when GDB connected"
         assert debug.get('paused') is True, "Expected debug.paused=true after GDB step"
 
-    def test_gdb_step_pauses_after_one_instruction(self, dosbox):
+    def test_gdb_step_pauses_after_one_instruction(self, gdb):
         """GDB step should execute one instruction and pause."""
         # Get initial state
-        regs_before = dosbox.gdb.read_registers()
-        eip_before = regs_before.eip
+        regs_before = gdb.read_registers()
+        eip_before = regs_before[EIP]
 
         # Step
-        result = dosbox.gdb.step()
-        assert result is not None
+        gdb.step()
+        result = gdb.wait_for_stop(timeout=5.0)
+        assert result != "", "step produced no stop reply"
 
         # After step, should be paused
-        regs_after = dosbox.gdb.read_registers()
+        regs_after = gdb.read_registers()
         assert regs_after is not None
 
-    def test_gdb_breakpoint_pauses_at_address(self, dosbox):
+    def test_gdb_breakpoint_pauses_at_address(self, gdb):
         """GDB breakpoint should pause execution when hit."""
         # Set a breakpoint at a test address
         test_addr = 0x1000
-        result = dosbox.gdb.set_breakpoint(test_addr)
+        result = gdb.set_breakpoint(test_addr)
         assert result is True
 
         # Clean up
-        dosbox.gdb.remove_breakpoint(test_addr)
+        gdb.remove_breakpoint(test_addr)
 
 
 class TestDebuggerMutualExclusion:
     """Test mutual exclusion between GDB and interactive debugger."""
 
-    def test_gdb_connection_blocks_interactive_debugger(self, dosbox, ensure_running):
+    def test_gdb_connection_blocks_interactive_debugger(self, gdb, qmp):
         """With GDB connected, attempting to open interactive debugger should fail."""
         # Ensure we're in a good state - halt first
-        dosbox.halt()
+        gdb.halt()
         time.sleep(0.2)
 
         # Verify GDB is connected and working
-        regs = dosbox.gdb.read_registers()
+        regs = gdb.read_registers()
         assert regs is not None
 
         # Ensure emulator is running
-        dosbox.continue_()
+        gdb.cont()
         time.sleep(0.3)
 
         # Try to activate interactive debugger via DEBUGBOX
-        dosbox.run_command("DEBUGBOX", wait_after=0.5)
+        _run_command(gdb, qmp, "DEBUGBOX", wait_after=0.5)
 
         # Halt to check state
-        dosbox.halt()
+        gdb.halt()
+        _drain_stop(gdb)
         time.sleep(0.2)
 
         # GDB should still be responsive
-        regs_after = dosbox.gdb.read_registers()
+        regs_after = gdb.read_registers()
         assert regs_after is not None, "GDB became unresponsive after DEBUGBOX attempt"
 
 
 class TestRemoteDebugIntegration:
     """Integration tests for remote debugging with DEBUGBOX."""
 
-    def test_gdb_and_qmp_simultaneous_connection(self, dosbox):
+    def test_gdb_and_qmp_simultaneous_connection(self, gdb, qmp):
         """Both GDB and QMP should be able to connect simultaneously."""
         # Ensure we're halted first for reliable register read
-        dosbox.halt()
+        gdb.halt()
         time.sleep(0.2)
 
         # Both connections should work
-        regs = dosbox.gdb.read_registers()
+        regs = gdb.read_registers()
         assert regs is not None
 
-        commands = dosbox.qmp.query_commands()
+        commands = qmp.execute("query-commands")
         assert commands is not None
 
-    def test_qmp_stop_and_query_status(self, dosbox):
+    def test_qmp_stop_and_query_status(self, gdb, qmp):
         """Pausing via QMP stop should be visible via QMP query-status."""
         # Ensure we start running
-        dosbox.continue_()
+        gdb.cont()
         time.sleep(0.3)
 
         # Stop via QMP
-        dosbox.qmp.stop()
+        qmp.execute("stop")
         time.sleep(0.2)
 
         # Check status - should show paused
-        status = dosbox.query_status().get('return', {})
+        status = qmp.execute("query-status")
         assert status.get('status') == 'paused', f"Expected status='paused', got {status}"
 
         # Resume via both QMP and GDB
-        dosbox.qmp.cont()
-        dosbox.continue_()
+        qmp.execute("cont")
+        gdb.cont()
         time.sleep(0.3)
 
         # Check status - should show running
-        status = dosbox.query_status().get('return', {})
+        status = qmp.execute("query-status")
         assert status.get('status') == 'running', f"Expected status='running', got {status}"
 
-    def test_gdb_registers_valid_during_pause(self, dosbox):
+    def test_gdb_registers_valid_during_pause(self, gdb):
         """Register values should be valid and consistent when paused."""
         # Halt to ensure we're in a stable state
-        dosbox.halt()
+        gdb.halt()
 
         # Read registers multiple times - should be consistent
-        regs1 = dosbox.gdb.read_registers()
-        regs2 = dosbox.gdb.read_registers()
+        regs1 = gdb.read_registers()
+        regs2 = gdb.read_registers()
 
-        # All registers should match (no execution happening)
-        for name in ['eax', 'ebx', 'ecx', 'edx', 'esp', 'ebp', 'esi', 'edi', 'eip']:
-            assert getattr(regs1, name) == getattr(regs2, name), f"Register {name} changed while paused"
+        # All general-purpose registers and EIP should match (no execution
+        # happening): indices 0-8 are EAX, ECX, EDX, EBX, ESP, EBP, ESI,
+        # EDI, EIP.
+        for i in range(9):
+            assert regs1[i] == regs2[i], f"Register index {i} changed while paused"
 
 
 # =============================================================================

@@ -182,5 +182,53 @@ def test_an_unknown_command_is_an_error_not_a_hang(qmp):
     assert "error" in reply
 
 
+# -- ported from the retired test_qmp_server.py ---------------------------
+#
+# send-key acks successfully whenever its `keys` array is non-empty, even
+# if every qcode in it is unrecognized (qmp.cpp:503-549 never checks
+# whether kbd_keys ended up empty before calling send_success()). That
+# means the legacy per-key-family tests (letters, digits, function keys,
+# navigation, punctuation, keypad) could never have caught a broken or
+# missing keymap entry -- a "yes" reply proves nothing about recognition,
+# the same shape of test the fixtures already make redundant. They are not
+# ported. What IS real protocol behaviour -- multi-key arrays, an empty
+# array being rejected, and an unrecognized qcode being silently accepted
+# rather than erroring -- is kept below. See task-11-report.md.
+
+def test_send_key_accepts_multiple_simultaneous_keys(qmp):
+    """The `keys` array holds keys pressed together (e.g. a modifier
+    combination), looping over press-then-release in reverse order --
+    a code path a single-key send-key never exercises."""
+    assert qmp.execute("send-key", {"keys": [
+        {"type": "qcode", "data": "shift"},
+        {"type": "qcode", "data": "a"},
+    ]}) is not None
+
+
+def test_send_key_rejects_an_empty_key_list(qmp):
+    """The legacy suite accepted either an error or silent success here.
+    The server actually rejects it outright with GenericError."""
+    reply = qmp.execute_raw("send-key", {"keys": []})
+    assert "error" in reply
+    assert reply["error"]["class"] == "GenericError"
+
+
+def test_send_key_silently_ignores_an_unrecognized_qcode(qmp):
+    """An unrecognized qcode is logged and dropped, not rejected -- pin
+    down the behaviour the legacy suite accepted either side of."""
+    assert qmp.execute("send-key", {"keys": [
+        {"type": "qcode", "data": "not_a_real_key_name_xyz"},
+    ]}) is not None
+
+
+def test_input_send_event_accepts_a_key_release(qmp):
+    """The conformance suite above only exercises `down: true`; the release
+    half of the same command is a separate code path in qmp.cpp."""
+    assert qmp.execute("input-send-event", {"events": [
+        {"type": "key", "data": {"down": False,
+                                 "key": {"type": "qcode", "data": "a"}}},
+    ]}) is not None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
