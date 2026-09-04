@@ -178,8 +178,36 @@ defensible, and stops it duplicating `dbxdebug`.
 - Existing behavioral tests (`test_debugbox.py`, `test_video_tools.py`) stay,
   rebased onto `launcher.py`.
 
-`dosbox_debug.py` is deleted. `DOSBoxInstance` in particular is not worth
-preserving.
+### 3.4 `dosbox_debug.py` survives Stage 1
+
+`dosbox_debug.py` is **not** deleted in Stage 1. `powerbasic-decompile`'s
+`session.py` imports `GDBClient` / `QMPClient` from it by path
+(`_import_clients()`), so deleting it before `dbxdebug` ships the replacement
+breaks pb for the whole gap. It is deleted at the end of Stage 2, once
+`dbxdebug` is released and pb has somewhere to go.
+
+Two changes it does get in Stage 1:
+
+- **A deprecation notice** naming `dbxdebug` as the replacement and this spec
+  as the reason.
+- **A packed-far-pointer guard** in `set_breakpoint` / `remove_breakpoint`:
+  raise on any address `>= 0x110000`. Real-mode linear addresses stop just
+  past 1 MB including the HMA, so nothing legitimate lands there, whereas a
+  packed `0x0824:5A90` arrives as `0x08245A90`.
+
+The guard exists for pb specifically. Its `bp_addr` packs `(seg << 16) | off`,
+which is correct against today's stub and *wrong* the moment Stage 1 lands —
+and pb reaches the stub through this client, which has no `qSupported`
+handshake. Without the guard pb's breakpoints would go quietly dead on the
+next rebuild, which is the exact failure mode this whole design exists to
+remove.
+
+Note the inverse, which needs no action: `dosbox_debug.py`'s own
+`(seg << 4) + off` conversion *is* the linear address, so its breakpoints
+become correct for the first time when Stage 1 lands.
+
+`DOSBoxInstance` is not worth preserving and goes with the file in Stage 2.
+Nothing in this repo depends on it after §3.2; `launcher.py` covers CI.
 
 ### 3.3 Upstream PR
 
@@ -282,7 +310,8 @@ migration is:
 1. Rewrite `tools/dosbox/__init__.py` as a re-export of `dbxdebug`. The 38
    call sites keep working untouched.
 2. Rewrite call sites to import `dbxdebug` directly.
-3. Delete `tools/dosbox/session.py` and the shim.
+3. Delete `tools/dosbox/session.py` and the shim. `dosbox_debug.py` is
+   deleted upstream once this step is reached (see 3.4).
 4. Convert the 8 files still hardcoding 2159/4444 in the same sweep, so no
    second class of caller survives.
 5. Replace `bp_addr` uses with linear addresses.
