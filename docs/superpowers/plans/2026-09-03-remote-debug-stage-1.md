@@ -1207,7 +1207,7 @@ Expected: FAIL — `test_breakpoint_above_64k_fires_at_the_linear_address` repor
 
 - [ ] **Step 3: Fix the breakpoint address interpretation**
 
-In `src/debug/debug.cpp`, replace lines 6253-6267 (the `FP_SEG`/`FP_OFF` macros and both functions) with:
+In `src/debug/debug.cpp`, find the `FP_SEG`/`FP_OFF` macro definitions and the two functions immediately below them (`DEBUG_SetBreakpoint` and `DEBUG_RemoveBreakpoint`). Locate them by content, not line number — Task 4 edits `DEBUG_GetRegister` earlier in the same file and shifts everything below it. Replace all four with:
 
 ```c
  /* The GDB remote serial protocol's Z0/z0 address is LINEAR, the same as the
@@ -1826,9 +1826,15 @@ git commit -m "test: pin the gdbserver/qmpserver port option names"
 Run: `uv run --with pytest pytest tests/integration/test_video_tools.py --collect-only`
 Expected: collection error, `ImportError: cannot import name 'DOSVideoTools'`.
 
-- [ ] **Step 2: Remove the vestigial dependency**
+- [ ] **Step 2: Fix the runner**
 
-In `tests/integration/run_all.py`, delete the `"dbxdebug>=0.2.1",` line from the PEP 723 block, leaving only `"pytest>=8.0",`. Update the module docstring: the suite now starts its own emulator, so the "Prerequisites: DOSBox-X running with..." section is replaced by "Prerequisites: DOSBox-X built with ./build-debug --enable-remotedebug".
+Three changes to `tests/integration/run_all.py`:
+
+1. Delete the `"dbxdebug>=0.2.1",` line from the PEP 723 block, leaving only `"pytest>=8.0",`.
+
+2. **Delete the preflight server check.** `main()` currently calls `check_server()` against `localhost:2159` and `localhost:4444` and returns 1 with "ERROR: No servers available!" when neither answers. Every test now starts its own emulator on dynamic ports, so that check aborts the suite before it runs a single test — and when it does pass, it passed because it found *somebody else's* emulator. Remove `check_server`, the `GDB_HOST`/`GDB_PORT`/`QMP_HOST`/`QMP_PORT` constants, the `socket` import, and the whole availability block in `main()`, leaving `main()` to build the pytest args and call `pytest.main`.
+
+3. Update the module docstring: replace the "Prerequisites: DOSBox-X running with..." section with "Prerequisites: DOSBox-X built with ./build-debug --enable-remotedebug".
 
 - [ ] **Step 3: Rewrite the video tests against the raw client**
 
@@ -1977,7 +1983,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dosbox_debug import GDBClient, PackedAddressError
+from dosbox_debug import GDBClient, GDBError, PackedAddressError
 
 
 def test_a_packed_far_pointer_is_rejected():
@@ -1995,17 +2001,22 @@ def test_remove_breakpoint_rejects_it_too():
 
 def test_a_normal_linear_address_is_not_rejected():
     """0x30000 is a legitimate conventional-memory address. The guard must
-    not fire on it -- it only rejects values above the real-mode ceiling."""
+    not fire on it -- it only rejects values above the real-mode ceiling.
+
+    An unconnected client raises GDBError("Not connected") from
+    _send_packet, so reaching THAT is proof the guard let the address
+    through. A PackedAddressError here would be the bug.
+    """
     client = GDBClient()
-    with pytest.raises(AttributeError):
-        # No socket: the guard passed and it reached the send.
+    with pytest.raises(GDBError, match="Not connected"):
         client.set_breakpoint(0x30000)
 
 
 def test_the_seg_off_string_form_still_converts_linearly():
+    """0824:5a90 converts to 0x8340, comfortably under the ceiling."""
     client = GDBClient()
-    with pytest.raises(AttributeError):
-        client.set_breakpoint("0824:5a90")  # -> 0x8340, under the ceiling
+    with pytest.raises(GDBError, match="Not connected"):
+        client.set_breakpoint("0824:5a90")
 
 
 if __name__ == "__main__":
