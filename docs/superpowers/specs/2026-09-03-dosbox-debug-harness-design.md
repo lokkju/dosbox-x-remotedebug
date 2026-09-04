@@ -121,9 +121,31 @@ defensible, and stops it duplicating `dbxdebug`.
 
 3. **Service pending QMP work while GDB-halted (F6).** Drain
    `SAVESTATE_CheckPendingRequest()`, `EMULATOR_CheckPendingControl()` and
-   `QMP_ProcessPendingInputEvents()` before `Normal_Loop`'s early return, so
-   they run while stopped at a breakpoint. Either hoist `dosbox.cpp:474-478`
-   above the `DEBUG_CheckGDBStep()` call or drain in its `return true` branch.
+   `QMP_ProcessPendingInputEvents()` inside the `DEBUG_CheckGDBStep()`
+   `return true` branch in `Normal_Loop`, immediately before `return 0`:
+
+   ```c
+   if (DEBUG_CheckGDBStep()) {
+       // Halted for GDB, or a step just completed. The drains below are
+       // unreachable on this path, so service pending QMP work here.
+       SAVESTATE_CheckPendingRequest();
+       EMULATOR_CheckPendingControl();
+       QMP_ProcessPendingInputEvents();
+       return 0;
+   }
+   ```
+
+   Decided against hoisting `dosbox.cpp:474-478` above the
+   `DEBUG_CheckGDBStep()` call. Hoisting changes ordering on *every*
+   iteration of the emulation hot loop -- pending QMP control would be
+   handled before the GDB step check on every instruction batch -- trading a
+   behavior change in the running path for a fix in the halted path. The
+   branch version leaves the running path bit-identical to today and adds
+   behavior only where there is none, which is a far easier four lines to
+   defend in review. It also drains after a completed step, which is wanted.
+   Latency is fine: while halted `Normal_Loop` returns immediately and is
+   re-entered, so the drain runs at spin frequency rather than on a poll
+   interval.
 
 4. **Close the `memdump` race (F7), minimally.** Guard `handle_memdump`: when
    `DEBUG_IsCpuPausedForDebug()` is true the guest is not executing and memory
