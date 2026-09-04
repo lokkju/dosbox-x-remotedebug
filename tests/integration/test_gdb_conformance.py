@@ -66,5 +66,69 @@ def test_the_linear_pc_points_at_executable_memory(gdb):
     assert len(gdb.read_memory(linear_pc(regs), 1)) == 1
 
 
+# A linear address comfortably above 0x10000, which is where the packed and
+# linear interpretations of a Z0 argument stop coinciding.
+LOOP_ADDR = 0x30000
+JMP_SELF = b"\xeb\xfe"
+
+
+def _park_cpu_in_a_loop(gdb, addr: int = LOOP_ADDR) -> None:
+    """Halt, plant `jmp $` at `addr`, and point CS:IP at it.
+
+    CS and EIP are written separately via P. There is no single register
+    holding a linear PC to write.
+    """
+    gdb.halt()
+    assert gdb.write_memory(addr, JMP_SELF) is True
+    assert gdb.read_memory(addr, 2) == JMP_SELF
+    assert gdb.write_register(10, addr >> 4) is True   # CS
+    assert gdb.write_register(8, addr & 0xF) is True   # EIP, an offset
+
+
+def test_breakpoint_above_64k_fires_at_the_linear_address(gdb):
+    """Z0 must take a linear address, the same as m and M.
+
+    Before the fix DEBUG_SetBreakpoint split this argument with
+    FP_SEG(x) = x >> 16, so 0x30000 became 0003:0000 -- physical 0x30 --
+    which answers OK and never fires.
+    """
+    _park_cpu_in_a_loop(gdb)
+    gdb.remove_breakpoint(LOOP_ADDR)
+
+    assert gdb.set_breakpoint(LOOP_ADDR) is True
+    gdb.cont()
+    stop = gdb.wait_for_stop(timeout=15.0)
+    assert stop.startswith("S05"), (
+        f"breakpoint at linear 0x{LOOP_ADDR:X} never fired (got {stop!r}). "
+        f"The stub is interpreting the Z0 argument as a packed far pointer.")
+
+    regs = gdb.read_registers()
+    assert linear_pc(regs) == LOOP_ADDR, (
+        f"stopped at 0x{linear_pc(regs):X}, expected 0x{LOOP_ADDR:X}")
+
+
+def test_breakpoint_and_memory_agree_on_what_an_address_is(gdb):
+    """The byte `m` reads at L is the byte execution stops on at L."""
+    _park_cpu_in_a_loop(gdb)
+    assert gdb.read_memory(LOOP_ADDR, 2) == JMP_SELF
+    assert gdb.set_breakpoint(LOOP_ADDR) is True
+    gdb.cont()
+    assert gdb.wait_for_stop(timeout=15.0).startswith("S05")
+    regs = gdb.read_registers()
+    assert gdb.read_memory(linear_pc(regs), 2) == JMP_SELF
+
+
+def test_removing_a_breakpoint_lets_execution_continue(gdb):
+    _park_cpu_in_a_loop(gdb)
+    assert gdb.set_breakpoint(LOOP_ADDR) is True
+    gdb.cont()
+    assert gdb.wait_for_stop(timeout=15.0).startswith("S05")
+
+    assert gdb.remove_breakpoint(LOOP_ADDR) is True
+    gdb.cont()
+    assert gdb.wait_for_stop(timeout=3.0) == "", (
+        "execution stopped again after the breakpoint was removed")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

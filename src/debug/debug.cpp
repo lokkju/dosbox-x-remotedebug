@@ -6255,20 +6255,23 @@ uint32_t DEBUG_GetRegister(int reg) {
  }
 #endif
 
- #define FP_SEG(x) (uint16_t)((uint32_t)(x) >> 16)
- #define FP_OFF(x) (uint16_t)((uint32_t)(x))
+ /* The GDB remote serial protocol's Z0/z0 address is LINEAR, the same as the
+  * m and M packets. Segment zero makes GetAddress(0, off) == off in real
+  * mode (see GetAddress above), so the stored breakpoint location is exactly
+  * the linear address, and CheckBreakpoint compares it against the true
+  * physical PC, GetAddress(SegValue(cs), reg_eip).
+  *
+  * This used to split the argument as a far pointer with FP_SEG(x) = x >> 16.
+  * Any breakpoint above 0x10000 answered OK and never fired; below 0x10000
+  * the two interpretations coincide, which is why it looked like it worked. */
  bool DEBUG_SetBreakpoint(uint32_t address) {
-     uint16_t seg = FP_SEG(address);
-     uint16_t off = FP_OFF(address);
-     DEBUG_ShowMsg("Adding Breakpoint %x:%x", seg, off);
-     return CBreakpoint::AddBreakpoint(seg, off, false);
+     DEBUG_ShowMsg("Adding Breakpoint at linear %x", address);
+     return CBreakpoint::AddBreakpoint(0, address, false) != NULL;
  }
 
  bool DEBUG_RemoveBreakpoint(uint32_t address) {
-     uint16_t seg = address >> 16;
-     uint16_t off = address;
-     DEBUG_ShowMsg("Removing Breakpoint %x:%x", seg, off);
-     return CBreakpoint::DeleteBreakpoint(seg, off);
+     DEBUG_ShowMsg("Removing Breakpoint at linear %x", address);
+     return CBreakpoint::DeleteBreakpoint(0, address);
  }
 
 #if C_REMOTEDEBUG
