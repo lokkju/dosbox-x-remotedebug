@@ -183,7 +183,8 @@ class Emulator:
                 if self._proc.poll() is None:
                     os.killpg(pgid, signal.SIGKILL)
                 self._proc.wait(timeout=5.0)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError,
+                    subprocess.TimeoutExpired):
                 pass
             self._proc = None
         if self.workdir is not None and self.workdir.exists():

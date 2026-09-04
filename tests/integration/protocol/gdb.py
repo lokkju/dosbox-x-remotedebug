@@ -121,8 +121,11 @@ class RawGDB:
         return out
 
     def write_register(self, index: int, value: int) -> bool:
-        """Write ONE register via `P`. Note the g/G asymmetry on register 8:
-        reading gives SegPhys(cs)+eip, writing sets eip. Never round-trip."""
+        """Write ONE register via `P`. Register 8 is EIP, an offset within CS,
+        in both directions -- a `g`/`G` round-trip is safe on builds that
+        advertise `dosbox-x-eip-offset+`. Older builds returned
+        SegPhys(cs)+reg_eip from `g` while `G` wrote reg_eip, so a round-trip
+        silently moved the program counter there."""
         hex_val = value.to_bytes(4, "little").hex()
         return self.send(f"P{index:x}={hex_val}") == "OK"
 

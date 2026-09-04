@@ -144,3 +144,7 @@ contrib/macos/dosbox-x.plist
 
 # Beads issue database: local tooling, not part of the source tree
 .beads/
+
+# Python bytecode caches (e.g. tests/integration/)
+__pycache__/
+*.pyc

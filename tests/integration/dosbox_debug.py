@@ -39,12 +39,26 @@ class PackedAddressError(ValueError):
     stub answers OK either way -- the breakpoint simply never fires. Real-mode
     linear addresses stop just past 1 MB including the HMA, so anything at or
     above 0x110000 is a packed pair rather than an address.
+
+    This catches the common case and not every case. A packed pair with a
+    small segment is indistinguishable from a legitimate linear address --
+    `0010:0000` arrives as 0x00100000 and passes, meaning linear 0x100000
+    rather than the intended 0x100. Real DOS programs load well above
+    segment 0, so the realistic packing is caught.
     """
 
 
 @dataclass
 class Registers:
-    """CPU registers from GDB."""
+    """CPU registers from GDB.
+
+    IMPORTANT -- `eip` CHANGED MEANING. On builds advertising
+    `dosbox-x-eip-offset+` in qSupported, GDB register 8 is EIP: an offset
+    within CS. Older builds returned SegPhys(cs) + reg_eip, a linear
+    address. Compute the linear PC as `cs * 16 + eip`. Code written against
+    an older build that used `eip` directly as a linear address is now
+    silently wrong.
+    """
     eax: int = 0
     ecx: int = 0
     edx: int = 0
@@ -209,7 +223,12 @@ class GDBClient:
         return self._send_packet("?")
 
     def read_registers(self) -> Registers:
-        """Read all CPU registers."""
+        """Read all CPU registers.
+
+        `eip` is register 8: an offset within CS on builds advertising
+        `dosbox-x-eip-offset+`, not a linear address. Compute the linear PC
+        as `cs * 16 + eip`; see the `Registers` docstring for detail.
+        """
         response = self._send_packet("g")
 
         if response.startswith("E"):

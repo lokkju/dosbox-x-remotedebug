@@ -228,11 +228,19 @@ Nothing in this repo depends on it after §3.2; `launcher.py` covers CI.
 
 ### 3.3 Upstream PR
 
-Stage 1 is the PR. It is self-contained, has no new dependencies, fixes a
-protocol-conformance bug plus two threading bugs, and adds tests that pin all
-three. `docs/REMOTEDEBUG.md` is updated for the new address rule and points
-at `dbxdebug` for automation, which is a documentation reference and not a
-dependency.
+The remote-debug subsystem is fork-local, added in fork commit `2cc007655`
+("first pass at adding a gdb server"). `master` has none of it: no
+`src/debug/gdbserver.cpp`, `src/debug/qmp.cpp`, `include/gdbserver.h`,
+`include/qmp.h`, `docs/REMOTEDEBUG.md`, or `tests/integration/`, and no
+`C_REMOTEDEBUG` build flag. Upstream has no GDB server for Stage 1 to fix.
+
+That changes what "the PR" would mean. Stage 1's fixes -- the protocol-
+conformance bug plus two threading bugs, and the tests that pin them -- are
+corrections to a fork-local subsystem, not a patch against something
+upstream already has. Contributing them upstream would mean contributing the
+entire subsystem: roughly 7,000 lines including the QMP and GDB servers, not
+a small conformance patch. Whether that contribution is worth proposing, and
+in what form, is an open framing decision, not one this stage settles.
 
 ## 4. Stage 2 — `dbxdebug`
 

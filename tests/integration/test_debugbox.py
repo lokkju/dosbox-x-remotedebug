@@ -215,36 +215,21 @@ class TestDebugboxWithGdb:
 
     def test_gdb_sees_pause_after_breakpoint(self, gdb):
         """GDB should see the CPU paused when breakpoint is hit."""
-        # Read initial EIP
+        # Read initial linear PC
         regs = gdb.read_registers()
-        initial_eip = regs[EIP]
+        initial_pc = regs[CS] * 16 + regs[EIP]
 
         # Perform a step - this should pause and return
         gdb.step()
         result = gdb.wait_for_stop(timeout=5.0)
         assert result != "", "step produced no stop reply"
 
-        # Read registers after step
+        # Read registers after step and confirm the PC actually advanced
         regs_after = gdb.read_registers()
         assert regs_after is not None
-
-
-class TestDebugboxEntryPoint:
-    """Test that DEBUGBOX correctly breaks at program entry point."""
-
-    @pytest.fixture
-    def test_com_file(self):
-        """Create and provide path to test COM file."""
-        com_path = create_test_com_file()
-        if com_path is None:
-            pytest.skip("Could not create test COM file")
-        yield com_path
-
-    def test_debugbox_program_entry_detection(self, test_com_file):
-        """DEBUGBOX should pause at program entry point."""
-        # Just verify the COM file was created
-        assert test_com_file is not None
-        assert test_com_file.exists()
+        pc_after = regs_after[CS] * 16 + regs_after[EIP]
+        assert pc_after != initial_pc, (
+            f"PC did not advance after step: stayed at 0x{initial_pc:X}")
 
 
 class TestDebugboxEntryPointFull:
@@ -417,52 +402,89 @@ class TestGdbPauseState:
         """GDB step should execute one instruction and pause."""
         # Get initial state
         regs_before = gdb.read_registers()
-        eip_before = regs_before[EIP]
+        pc_before = regs_before[CS] * 16 + regs_before[EIP]
 
         # Step
         gdb.step()
         result = gdb.wait_for_stop(timeout=5.0)
         assert result != "", "step produced no stop reply"
 
-        # After step, should be paused
+        # After step, should be paused with the PC advanced
         regs_after = gdb.read_registers()
         assert regs_after is not None
+        pc_after = regs_after[CS] * 16 + regs_after[EIP]
+        assert pc_after != pc_before, (
+            f"PC did not advance after step: stayed at 0x{pc_before:X}")
 
     def test_gdb_breakpoint_pauses_at_address(self, gdb):
-        """GDB breakpoint should pause execution when hit."""
-        # Set a breakpoint at a test address
-        test_addr = 0x1000
-        result = gdb.set_breakpoint(test_addr)
-        assert result is True
+        """GDB breakpoint should pause execution when hit.
 
-        # Clean up
-        gdb.remove_breakpoint(test_addr)
+        A different linear address from test_gdb_conformance.py's LOOP_ADDR
+        (0x30000), above 0x10000 so a packed-far-pointer misinterpretation
+        of the Z0 argument would not accidentally coincide with it. Follows
+        the same plant-jmp-self / point-CS:IP / continue pattern as
+        `_park_cpu_in_a_loop` there.
+        """
+        test_addr = 0x40000
+        jmp_self = b"\xeb\xfe"
+
+        gdb.halt()
+        assert gdb.write_memory(test_addr, jmp_self) is True
+        assert gdb.read_memory(test_addr, 2) == jmp_self
+        assert gdb.write_register(CS, test_addr >> 4) is True
+        assert gdb.write_register(EIP, test_addr & 0xF) is True
+
+        assert gdb.set_breakpoint(test_addr) is True
+        try:
+            gdb.cont()
+            stop = gdb.wait_for_stop(timeout=15.0)
+            assert stop.startswith("S05"), (
+                f"breakpoint at linear 0x{test_addr:X} never fired "
+                f"(got {stop!r})")
+
+            regs = gdb.read_registers()
+            stopped_pc = regs[CS] * 16 + regs[EIP]
+            assert stopped_pc == test_addr, (
+                f"stopped at 0x{stopped_pc:X}, expected 0x{test_addr:X}")
+        finally:
+            gdb.remove_breakpoint(test_addr)
 
 
 class TestDebuggerMutualExclusion:
     """Test mutual exclusion between GDB and interactive debugger."""
 
     def test_gdb_connection_blocks_interactive_debugger(self, gdb, qmp):
-        """With GDB connected, attempting to open interactive debugger should fail."""
-        # Ensure we're in a good state - halt first
-        gdb.halt()
-        time.sleep(0.2)
+        """With GDB connected, DEBUGBOX must redirect to GDB rather than
+        open the interactive (curses) debugger.
 
+        The interactive debugger draws to a window on the host console,
+        not the guest framebuffer, so its UI is not observable through
+        GDB/QMP. What IS observable is the mutual-exclusion behavior in
+        DEBUG_Enable_Handler (src/debug/debug.cpp): with a GDB client
+        connected it never falls through to the interactive debugger --
+        it sends a SIGTRAP stop reply to GDB instead. If that redirection
+        were broken and the interactive debugger opened instead, it would
+        block waiting for host-console input and no stop reply would ever
+        arrive here, so wait_for_stop() would time out.
+        """
         # Verify GDB is connected and working
         regs = gdb.read_registers()
         assert regs is not None
 
-        # Ensure emulator is running
+        # Ensure emulator is running so DEBUGBOX has something to interrupt
         gdb.cont()
         time.sleep(0.3)
 
-        # Try to activate interactive debugger via DEBUGBOX
-        _run_command(gdb, qmp, "DEBUGBOX", wait_after=0.5)
+        # Trigger DEBUGBOX; verify=False avoids a halt/cont race with the
+        # stop reply we're about to wait for.
+        _run_command(gdb, qmp, "DEBUGBOX", wait_after=0.2, verify=False)
 
-        # Halt to check state
-        gdb.halt()
-        _drain_stop(gdb)
-        time.sleep(0.2)
+        stop = gdb.wait_for_stop(timeout=5.0)
+        assert stop.startswith("S05"), (
+            f"expected a SIGTRAP stop reply when DEBUGBOX ran with a GDB "
+            f"client connected -- the mutual-exclusion redirect in "
+            f"DEBUG_Enable_Handler did not fire (got {stop!r}); the "
+            f"interactive debugger may have opened instead")
 
         # GDB should still be responsive
         regs_after = gdb.read_registers()

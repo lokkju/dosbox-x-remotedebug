@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from protocol.qmp import QMPProtocolError, RawQMP
+from protocol.qmp import RawQMP
 
 
 def test_savestate_completes_while_halted_for_gdb(emulator, tmp_path):
