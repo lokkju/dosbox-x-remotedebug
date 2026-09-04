@@ -701,6 +701,26 @@ void QMPServer::handle_memdump(const std::string& cmd) {
         filepath = file;
     }
 
+    /* memdump is the only QMP handler that reaches into guest state from
+     * the socket thread; savestate, screendump and the input queue all
+     * defer to the emulation thread. When the CPU is stopped for debugging
+     * no guest code is executing, so memory is quiescent and reading it
+     * here races nothing. When it is running, defer.
+     *
+     * The deferred path currently reports busy rather than queueing. A
+     * request/response marshal with condition-variable signalling is
+     * deliberately not built yet: the existing SAVESTATE_* idiom polls at
+     * 100ms, which would destroy the 30-60Hz use case this command exists
+     * for, and dumping a RUNNING guest at that rate has no measured
+     * consumer. See section 3.1 of the Stage 1 design spec. */
+    if (!DEBUG_IsCpuPausedForDebug()) {
+        if (use_temp) unlink(filepath.c_str());
+        send_error("GenericError",
+                   "memdump requires the CPU to be stopped for debugging; "
+                   "halt via GDB or QMP stop first");
+        return;
+    }
+
     // Perform the memory dump
     if (!DEBUG_SaveMemoryBin(filepath.c_str(), (uint32_t)address, (uint32_t)size)) {
         if (use_temp) unlink(filepath.c_str());
