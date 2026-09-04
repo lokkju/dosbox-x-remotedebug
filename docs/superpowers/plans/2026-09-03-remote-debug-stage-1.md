@@ -515,8 +515,15 @@ class RawQMP:
                 self._sock = None
 
     def _recv_json(self) -> dict:
+        """Read one newline-delimited reply, or raise on timeout.
+
+        The per-call socket timeout is re-derived from the deadline on every
+        pass and socket.timeout is caught, so an unresponsive server produces
+        a QMPProtocolError rather than a bare TimeoutError escaping to the
+        caller. protocol/gdb.py's wait_for_stop does the same.
+        """
         deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        while True:
             if b"\n" in self._buf:
                 line, self._buf = self._buf.split(b"\n", 1)
                 line = line.strip()
@@ -527,13 +534,20 @@ class RawQMP:
                 except json.JSONDecodeError as exc:
                     raise QMPProtocolError(
                         f"not JSON: {line!r}") from exc
-            chunk = self._sock.recv(65536)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self._sock.settimeout(remaining)
+            try:
+                chunk = self._sock.recv(65536)
+            except (socket.timeout, TimeoutError):
+                break
             if not chunk:
                 raise QMPProtocolError("connection closed")
             self._buf += chunk
         raise QMPProtocolError("timed out waiting for a reply")
 
-    def execute_raw(self, command: str, arguments: dict = None) -> dict:
+    def execute_raw(self, command: str, arguments: "dict | None" = None) -> dict:
         payload = {"execute": command}
         if arguments is not None:
             payload["arguments"] = arguments
@@ -544,7 +558,7 @@ class RawQMP:
             if "return" in reply or "error" in reply:
                 return reply
 
-    def execute(self, command: str, arguments: dict = None) -> dict:
+    def execute(self, command: str, arguments: "dict | None" = None) -> dict:
         reply = self.execute_raw(command, arguments)
         if "error" in reply:
             err = reply["error"]
