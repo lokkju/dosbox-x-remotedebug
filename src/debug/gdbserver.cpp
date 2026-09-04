@@ -3,6 +3,7 @@
 #if C_REMOTEDEBUG
 
 #include <errno.h>
+#include <stdexcept>
 #include "gdbserver.h"
 #include "debug.h"
 #include "logging.h"
@@ -292,51 +293,66 @@ GDBAction GDBServer::process_command(const std::string& cmd) {
         return GDBAction::STOP;  // Tell debug.cpp to pause CPU
     }
 
-    if (cmd == "QStartNoAckMode") {
-        noack_mode = true;
-        send_packet("OK");
-    } else if (cmd == "vMustReplyEmpty") {
-        send_packet("");
-    } else if (cmd == "?") {
-        // Query halt reason - GDB wants us stopped
-        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Halt reason query, stopping CPU");
-        send_stop_reply(5);  // SIGTRAP
-        return GDBAction::STOP;  // Tell debug.cpp to pause CPU
-    } else if (cmd.substr(0, 1) == "H") {
-        send_packet("OK");
-    } else if (cmd.substr(0, 1) == "p") {
-        handle_read_register(cmd);
-    } else if (cmd.substr(0, 1) == "P") {
-        handle_write_register(cmd.substr(1));
-    } else if (cmd == "g") {
-        handle_read_registers();
-    } else if (cmd.substr(0, 1) == "G") {
-        handle_write_registers(cmd.substr(1));
-    } else if (cmd.substr(0, 1) == "m") {
-        handle_read_memory(cmd.substr(1));
-    } else if (cmd.substr(0, 1) == "M") {
-        handle_write_memory(cmd.substr(1));
-    } else if (cmd.substr(0, 1) == "Z" || cmd.substr(0, 1) == "z") {
-        handle_breakpoint(cmd);
-    } else if (cmd == "s" || cmd.substr(0, 1) == "s") {
-        // Step - return action, debugger will call send_stop_reply() when done
-        return GDBAction::STEP;
-    } else if (cmd == "c" || cmd.substr(0, 1) == "c") {
-        // Continue - return action, debugger will call send_stop_reply() on breakpoint
-        return GDBAction::CONTINUE;
-    } else if (cmd.substr(0, 1) == "q") {
-        handle_query(cmd.substr(1));
-    } else if (cmd.substr(0, 5) == "vCont") {
-        return handle_v_packets(cmd);
-    } else if (cmd == "D" || cmd.substr(0, 2) == "D;") {
-        LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Client detaching");
-        send_packet("OK");
-        close(client_fd);
-        client_fd = -1;
-        return GDBAction::DISCONNECT;
-    } else {
-        LOG(LOG_REMOTE, LOG_DEBUG)("GDBServer: Unhandled command: %s", cmd.c_str());
-        send_packet("");
+    /* Malformed packet input (bad hex, missing separators, etc.) makes
+     * handle_breakpoint / handle_read_memory / handle_write_memory /
+     * handle_write_registers / handle_write_register throw
+     * std::invalid_argument or std::out_of_range out of std::stoul/std::stoi.
+     * This runs on the main emulation thread, so an uncaught throw here
+     * would call std::terminate and take the whole emulator down instead of
+     * just dropping the debug connection. One catch around the whole
+     * dispatch covers every handler; per-handler try/catch would be
+     * redundant. */
+    try {
+        if (cmd == "QStartNoAckMode") {
+            noack_mode = true;
+            send_packet("OK");
+        } else if (cmd == "vMustReplyEmpty") {
+            send_packet("");
+        } else if (cmd == "?") {
+            // Query halt reason - GDB wants us stopped
+            LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Halt reason query, stopping CPU");
+            send_stop_reply(5);  // SIGTRAP
+            return GDBAction::STOP;  // Tell debug.cpp to pause CPU
+        } else if (cmd.substr(0, 1) == "H") {
+            send_packet("OK");
+        } else if (cmd.substr(0, 1) == "p") {
+            handle_read_register(cmd);
+        } else if (cmd.substr(0, 1) == "P") {
+            handle_write_register(cmd.substr(1));
+        } else if (cmd == "g") {
+            handle_read_registers();
+        } else if (cmd.substr(0, 1) == "G") {
+            handle_write_registers(cmd.substr(1));
+        } else if (cmd.substr(0, 1) == "m") {
+            handle_read_memory(cmd.substr(1));
+        } else if (cmd.substr(0, 1) == "M") {
+            handle_write_memory(cmd.substr(1));
+        } else if (cmd.substr(0, 1) == "Z" || cmd.substr(0, 1) == "z") {
+            handle_breakpoint(cmd);
+        } else if (cmd == "s" || cmd.substr(0, 1) == "s") {
+            // Step - return action, debugger will call send_stop_reply() when done
+            return GDBAction::STEP;
+        } else if (cmd == "c" || cmd.substr(0, 1) == "c") {
+            // Continue - return action, debugger will call send_stop_reply() on breakpoint
+            return GDBAction::CONTINUE;
+        } else if (cmd.substr(0, 1) == "q") {
+            handle_query(cmd.substr(1));
+        } else if (cmd.substr(0, 5) == "vCont") {
+            return handle_v_packets(cmd);
+        } else if (cmd == "D" || cmd.substr(0, 2) == "D;") {
+            LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Client detaching");
+            send_packet("OK");
+            close(client_fd);
+            client_fd = -1;
+            return GDBAction::DISCONNECT;
+        } else {
+            LOG(LOG_REMOTE, LOG_DEBUG)("GDBServer: Unhandled command: %s", cmd.c_str());
+            send_packet("");
+        }
+    } catch (const std::exception& e) {
+        LOG(LOG_REMOTE, LOG_ERROR)("GDBServer: exception handling command '%s': %s",
+                                    cmd.c_str(), e.what());
+        send_packet("E01");
     }
 
     return GDBAction::NONE;
@@ -405,6 +421,12 @@ void GDBServer::handle_write_register(const std::string& args) {
         return;
     }
     int reg = (int)std::stoul(args.substr(0, eq), nullptr, 16);
+    /* DEBUG_SetRegister's switch has no default case, so an out-of-range
+     * index is silently discarded and would otherwise still get "OK". */
+    if (reg < 0 || reg > 15) {
+        send_packet("E01");
+        return;
+    }
     uint32_t value = (uint32_t)std::stoul(args.substr(eq + 1), nullptr, 16);
     DEBUG_SetRegister(reg, swap32(value));
     send_packet("OK");

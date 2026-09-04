@@ -269,5 +269,82 @@ def test_a_client_can_disconnect_and_reconnect(emulator):
     second.close()
 
 
+# -- hardening: malformed input must not kill the stub -------------------
+#
+# gdbserver.cpp had no try/catch anywhere. std::stoul/std::stoi in the
+# handlers below throw std::invalid_argument or std::out_of_range on
+# malformed input, and process_command runs on the main emulation thread --
+# an uncaught throw there calls std::terminate and takes the whole emulator
+# down, not just the debug connection.
+
+MALFORMED_PACKETS = ["m,", "mzzzz,4", "Z0,zzzz,1", "P=1234", "Pzz=1234"]
+
+
+def test_malformed_packets_get_an_error_reply_not_a_dead_emulator(gdb):
+    """The point of this test is the liveness check at the end, not the
+    individual error replies: a crash inside process_command would kill the
+    connection (or the whole process) rather than politely returning E01."""
+    for packet in MALFORMED_PACKETS:
+        reply = gdb.send(packet)
+        assert reply.startswith("E"), (
+            f"packet {packet!r} did not get an error reply: {reply!r}")
+
+    # The stub must still be alive and responsive after every malformed
+    # packet above.
+    features = gdb.supported()
+    assert "PacketSize=" in features, (
+        "stub did not answer qSupported after malformed input -- "
+        "the connection (or emulator) did not survive")
+    regs = gdb.read_registers()
+    assert len(regs) == 16, (
+        "stub did not answer a register read after malformed input")
+
+
+# -- hardening: P must reject an out-of-range register --------------------
+#
+# DEBUG_SetRegister's switch has no default case, so an index above 15 was
+# silently discarded while handle_write_register still replied "OK".
+
+def test_write_register_rejects_an_out_of_range_index(gdb):
+    reply = gdb.send("P10=00000000")  # index 16, one past GS (15)
+    assert reply.startswith("E"), (
+        f"P with index 16 should be rejected, got {reply!r}")
+
+
+def test_write_register_still_accepts_a_valid_index(gdb):
+    gdb.halt()
+    assert gdb.write_register(3, 0xdeadbeef) is True
+    assert gdb.read_registers()[3] == 0xdeadbeef
+
+
+# -- regression: the protected-mode breakpoint guard must not affect real
+#    mode ------------------------------------------------------------------
+#
+# DEBUG_SetBreakpoint/DEBUG_RemoveBreakpoint now refuse when
+# cpu.pmode && !(reg_flags & FLAG_VM). This harness never enters protected
+# mode, so this test always exercises the real-mode path and guards against
+# that new check breaking it. The protected-mode branch itself is NOT
+# reachable from this harness and is therefore unverified by test.
+
+REAL_MODE_GUARD_ADDR = 0x30020
+
+
+def test_breakpoint_above_64k_still_works_after_the_pmode_guard(gdb):
+    _park_cpu_in_a_loop(gdb, REAL_MODE_GUARD_ADDR)
+    gdb.remove_breakpoint(REAL_MODE_GUARD_ADDR)
+
+    assert gdb.set_breakpoint(REAL_MODE_GUARD_ADDR) is True, (
+        "real-mode breakpoint above 0x10000 was refused -- "
+        "the protected-mode guard is over-broad")
+    gdb.cont()
+    stop = gdb.wait_for_stop(timeout=15.0)
+    assert stop.startswith("S05"), (
+        f"real-mode breakpoint above 0x10000 never fired (got {stop!r})")
+    regs = gdb.read_registers()
+    assert linear_pc(regs) == REAL_MODE_GUARD_ADDR, (
+        f"stopped at 0x{linear_pc(regs):X}, expected 0x{REAL_MODE_GUARD_ADDR:X}")
+    assert gdb.remove_breakpoint(REAL_MODE_GUARD_ADDR) is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

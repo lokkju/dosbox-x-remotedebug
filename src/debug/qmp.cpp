@@ -1051,6 +1051,30 @@ void QMPServer::handle_system_reset(const std::string& cmd) {
 
     bool dos_only = extract_bool(args_str, "dos_only", false);
 
+    /* handle_memdump refuses when it cannot produce a coherent result; this
+     * handler is reachable on the same GDB-halted path (see the drain fix
+     * referenced in handle_memdump above) and must not answer differently.
+     * Rebooting the guest while a GDB client still believes it is attached
+     * at a halt leaves that client staring at a session -- registers,
+     * memory, breakpoints -- that no longer exists.
+     *
+     * The alternative -- reset anyway and then somehow notify the GDB
+     * client -- was considered and rejected: what "notify" should mean here
+     * (a synthetic stop reply? forcibly detaching? something else?) is not
+     * obvious, and refusing is honest where guessing would not be.
+     *
+     * EMULATOR_IsPaused() is deliberately NOT part of this condition. A
+     * plain QMP `stop` has no debug client attached to confuse, so a reset
+     * from there stays allowed -- unlike memdump, there is no coherency
+     * concern: system_reset does not read guest state, it just requests a
+     * reset that the main thread will perform. */
+    if (DEBUG_IsCpuPausedForDebug()) {
+        send_error("GenericError",
+                   "system_reset refused: the CPU is halted for debugging; "
+                   "continue or detach the debug client first");
+        return;
+    }
+
     // Request reset (will be processed by main thread)
     EMULATOR_RequestReset(dos_only);
 

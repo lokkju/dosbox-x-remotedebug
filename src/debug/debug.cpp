@@ -916,7 +916,16 @@ void CBreakpoint::ShowList(void)
 	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
 		CBreakpoint* bp = (*i);
 		if (bp->GetType()==BKPNT_PHYSICAL) {
-			DEBUG_ShowMsg("%02X. BP %04X:%04X\n",nr,bp->GetSegment(),bp->GetOffset());
+			/* A breakpoint set via the GDB stub's Z0 (DEBUG_SetBreakpoint)
+			 * stores segment 0 and the full linear address as the offset,
+			 * so "%04X:%04X" would print e.g. "0000:30000" -- an offset
+			 * wider than every other entry's 16-bit field. Display only;
+			 * what is stored and matched is unchanged. */
+			if (bp->GetSegment()==0 && bp->GetOffset()>0xFFFF) {
+				DEBUG_ShowMsg("%02X. BP %08X (linear)\n",nr,bp->GetOffset());
+			} else {
+				DEBUG_ShowMsg("%02X. BP %04X:%04X\n",nr,bp->GetSegment(),bp->GetOffset());
+			}
 		} else if (bp->GetType()==BKPNT_INTERRUPT) {
 			if (bp->GetValue()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X\n",nr,bp->GetIntNr());
 			else if (bp->GetOther()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X AH=%02X\n",nr,bp->GetIntNr(),bp->GetValue());
@@ -6263,13 +6272,30 @@ uint32_t DEBUG_GetRegister(int reg) {
   *
   * This used to split the argument as a far pointer with FP_SEG(x) = x >> 16.
   * Any breakpoint above 0x10000 answered OK and never fired; below 0x10000
-  * the two interpretations coincide, which is why it looked like it worked. */
+  * the two interpretations coincide, which is why it looked like it worked.
+  *
+  * In protected mode (cpu.pmode && !(reg_flags & FLAG_VM)) GetAddress(0, off)
+  * routes through LinMakeProt(0, off), which rejects selector 0 (selectors
+  * below 8 are never valid) and returns mem_no_address -- so the breakpoint
+  * above would be stored at a garbage location and could never fire, while
+  * Z0 answered OK. Rather than lie about it, refuse outright so the caller
+  * sends E01. Protected-mode breakpoints are NOT implemented here -- this
+  * only stops the stub from claiming success for one it silently dropped.
+  * Real-mode behaviour (the case above) is unchanged. */
  bool DEBUG_SetBreakpoint(uint32_t address) {
+     if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+         DEBUG_ShowMsg("Refusing breakpoint at linear %x: protected mode is not supported", address);
+         return false;
+     }
      DEBUG_ShowMsg("Adding Breakpoint at linear %x", address);
      return CBreakpoint::AddBreakpoint(0, address, false) != NULL;
  }
 
  bool DEBUG_RemoveBreakpoint(uint32_t address) {
+     if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+         DEBUG_ShowMsg("Refusing to remove breakpoint at linear %x: protected mode is not supported", address);
+         return false;
+     }
      DEBUG_ShowMsg("Removing Breakpoint at linear %x", address);
      return CBreakpoint::DeleteBreakpoint(0, address);
  }

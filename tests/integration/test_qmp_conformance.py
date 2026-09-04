@@ -246,5 +246,37 @@ def test_a_client_can_disconnect_and_reconnect(emulator):
     second.close()
 
 
+def test_system_reset_refuses_while_halted_for_gdb(emulator):
+    """handle_memdump already refuses when it cannot produce a coherent
+    result; system_reset is reachable on the same GDB-halted path and must
+    not answer differently. Rebooting the guest while a GDB client still
+    believes it is attached at a halt leaves that client looking at a
+    session -- registers, memory, breakpoints -- that no longer exists.
+
+    Both halves matter: the first proves the halted case is refused, the
+    second proves system_reset was not simply broken outright.
+    """
+    gdb = emulator.gdb()
+    qmp = emulator.qmp()
+
+    gdb.halt()
+    reply = qmp.execute_raw("system_reset")
+    assert "error" in reply, "system_reset succeeded while halted for GDB"
+    assert "halt" in reply["error"]["desc"].lower(), (
+        f"refusal did not mention the halt: {reply['error']}")
+
+    gdb.cont()
+    deadline = time.time() + 5.0
+    status = qmp.execute("query-status")
+    while status.get("debug", {}).get("paused") and time.time() < deadline:
+        time.sleep(0.1)
+        status = qmp.execute("query-status")
+    assert not status.get("debug", {}).get("paused"), (
+        "debug pause never cleared after gdb.cont()")
+
+    # Must not raise: system_reset succeeds once the debug halt is gone.
+    qmp.execute("system_reset")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
