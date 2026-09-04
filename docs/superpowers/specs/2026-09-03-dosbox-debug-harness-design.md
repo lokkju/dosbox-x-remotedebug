@@ -19,11 +19,13 @@ re-verified against this repo's source at HEAD.
 ### 1.1 What the review found
 
 **F1 — `Z0` and `m` disagree about what an address is.**
-`gdbserver.cpp:448` parses the `Z0` address and passes it to
-`DEBUG_SetBreakpoint` (`debug.cpp:6255`), which splits it as a far pointer
-via `FP_SEG(x) = x >> 16`. `handle_read_memory` calls
-`DEBUG_ReadMemory(address + i)` (`debug.cpp:6166`), which is `mem_readb_checked`
-— genuinely linear. The stub is internally inconsistent and non-conformant
+`GDBServer::handle_breakpoint` parses the `Z0` address and passes it to
+`DEBUG_SetBreakpoint`, which splits it as a far pointer via
+`FP_SEG(x) = x >> 16`. `handle_read_memory` calls
+`DEBUG_ReadMemory(address + i)`, which is `mem_readb_checked`
+— genuinely linear. (Fixed in Stage 1; see §3.1 item 1 below.
+`DEBUG_SetBreakpoint` now takes a linear address too, and the `FP_SEG`/
+`FP_OFF` split no longer exists.) The stub is internally inconsistent and non-conformant
 with the GDB remote serial protocol: real `gdb` setting a breakpoint above
 `0x10000` gets `OK` and never stops. `dosbox_debug.py` uses
 `(seg << 4) + off` for both, so its breakpoints are wrong above 64 KB, where
@@ -36,14 +38,15 @@ via `__exit__`. Measured downstream cost in one week: ten orphaned emulators
 running 80 minutes (load average 67-79, an unrelated suite going 2.5 min to
 24 min); a QMP bind race losing 1 trial in 27.
 
-**F3 — `QMPClient` wraps about half the server.** `qmp.cpp:404` dispatches
+**F3 — `QMPClient` wraps about half the server.** `QMPServer::process_command`
+(`qmp.cpp:401`) dispatches
 `memdump`, `screendump`, `savestate`, `loadstate`, `system_reset` and `quit`;
 the Python client exposes none of them. `memdump` returns base64 up to 16 MB
 and is the answer to a downstream segment scan that cost 7,168 GDB
 round-trips.
 
 **F4 — The config option names are a trap.** They are `gdbserver port` and
-`qmpserver port`, with a space (`dosbox.cpp:1726`, `:1732`). `gdbport` /
+`qmpserver port`, with a space (`dosbox.cpp:1734`, `:1740`). `gdbport` /
 `qmpport` are not options; they are ignored, the server falls back to
 2159/4444, and the client connects to a *different agent's emulator*. This
 happened and produced `QMPError: Failed to receive valid JSON: b''`.
@@ -55,12 +58,14 @@ banner — which is text, so a "screen is not blank" gate passes it. Two
 downstream capture scripts shipped 24 frames of banner.
 
 **F6 — Pending QMP work is not serviced while GDB-halted.**
-`DEBUG_CheckGDBStep()` returns true while `gdb_cpu_paused` (`debug.cpp:6244`),
-and `Normal_Loop` returns at `dosbox.cpp:471` — before the drains at
-`:474-478`. So `SAVESTATE_CheckPendingRequest()`,
-`EMULATOR_CheckPendingControl()` and `QMP_ProcessPendingInputEvents()` never
-run while stopped at a breakpoint. `savestate` at a breakpoint waits 30 s and
-errors; keys queued at a breakpoint are never delivered.
+`DEBUG_CheckGDBStep()` returns true while `gdb_cpu_paused`, and `Normal_Loop`
+returned before reaching the drains further down its loop body. So
+`SAVESTATE_CheckPendingRequest()`, `EMULATOR_CheckPendingControl()` and
+`QMP_ProcessPendingInputEvents()` never ran while stopped at a breakpoint.
+`savestate` at a breakpoint waited 30 s and errored; keys queued at a
+breakpoint were never delivered. (Fixed in Stage 1; see §3.1 item 3 below --
+`Normal_Loop` (`dosbox.cpp:469`) now calls all three drains inside the
+`DEBUG_CheckGDBStep()` branch before returning.)
 
 **F7 — `memdump` races the emulation thread.** It is the only QMP handler
 that touches guest state from the socket thread. `savestate`/`loadstate`,
@@ -103,17 +108,16 @@ defensible, and stops it duplicating `dbxdebug`.
 ### 3.1 C++ changes
 
 1. **Linear breakpoint addresses.** `DEBUG_SetBreakpoint` /
-   `DEBUG_RemoveBreakpoint` (`debug.cpp:6255-6267`) take a linear address,
+   `DEBUG_RemoveBreakpoint` (`debug.cpp:6267-6275`) take a linear address,
    matching `DEBUG_ReadMemory`. Implement as `AddBreakpoint(0, linear, false)`:
    `GetAddress(0, off)` returns `(0 << 4) + off` in real mode
    (`debug.cpp:450`), so the stored `location` is exactly `linear`, and
    `CheckBreakpoint` already compares against the true physical
-   `SegPhys(cs) + eip`. Delete the `FP_SEG` / `FP_OFF` macros
-   (`debug.cpp:6253-6254`). `gdbserver.cpp` is the only caller of either
-   function and the macros are used nowhere else, so this is six lines with
-   one call site each.
+   `SegPhys(cs) + eip`. Delete the `FP_SEG` / `FP_OFF` macros.
+   `gdbserver.cpp` is the only caller of either function and the macros are
+   used nowhere else, so this is six lines with one call site each.
 
-2. **Capability handshake.** `handle_query` (`gdbserver.cpp:467`) appends a
+2. **Capability handshake.** `handle_query` (`gdbserver.cpp:479`) appends a
    vendor feature: `…;QStartNoAckMode+;dosbox-x-linear-bp+`. Real `gdb`
    ignores unknown `qSupported` features, so this stays RSP-legal. It lets a
    client refuse a pre-fix stub loudly instead of silently missing every
@@ -135,7 +139,7 @@ defensible, and stops it duplicating `dbxdebug`.
    }
    ```
 
-   Decided against hoisting `dosbox.cpp:474-478` above the
+   Decided against hoisting `dosbox.cpp:482-486` above the
    `DEBUG_CheckGDBStep()` call. Hoisting changes ordering on *every*
    iteration of the emulation hot loop -- pending QMP control would be
    handled before the GDB step check on every instruction batch -- trading a
@@ -148,10 +152,18 @@ defensible, and stops it duplicating `dbxdebug`.
    interval.
 
 4. **Close the `memdump` race (F7), minimally.** Guard `handle_memdump`: when
-   `DEBUG_IsCpuPausedForDebug()` is true the guest is not executing and memory
-   is quiescent, so read directly; otherwise defer to the emulation thread
-   using the request/poll idiom `SAVESTATE_*` already establishes. Dumping at
-   a breakpoint — the common case — keeps zero added latency.
+   `DEBUG_IsCpuPausedForDebug()` **or** `EMULATOR_IsPaused()` is true the
+   guest is not executing and memory is quiescent, so read directly;
+   otherwise refuse. The two flags are disjoint and both leave memory
+   quiescent: `DEBUG_IsCpuPausedForDebug()` covers the interactive debugger
+   and a GDB halt, `EMULATOR_IsPaused()` covers a QMP `stop`, which parks the
+   emulation thread in `PauseDOSBoxLoop`. This is slightly wider than
+   originally scoped here (which named only the GDB/debugger flag), because
+   a QMP `stop` quiesces the guest just as completely and gates the running
+   guest case at essentially no extra cost. Dumping at a breakpoint — the
+   common case — keeps zero added latency. The refusal path returns an
+   error rather than deferring to the emulation thread; no request/poll
+   idiom is implemented for `memdump`.
 
    Explicitly deferred: a condition-variable path for high-rate dumps of a
    *running* guest. The idiom's 50–100 ms sleep-poll would defeat the 30–60 Hz
@@ -170,7 +182,7 @@ defensible, and stops it duplicating `dbxdebug`.
   `z`, `s`, `c`, `vCont`, `D`), plus the address-semantics contract: a
   breakpoint set at linear `L` above `0x10000` fires at `L`, and `m L` reads
   the byte it is on. This is the test that would have caught F1.
-- `test_qmp_conformance.py` — one assertion per entry in the `qmp.cpp:404`
+- `test_qmp_conformance.py` — one assertion per entry in the `qmp.cpp:401`
   dispatch, including error shapes, plus a regression test for F6 (savestate
   and queued keys complete while GDB-halted).
 - `test_config.py` — a conf written with `gdbserver port = N` results in a
@@ -364,10 +376,12 @@ to someone else's emulator"), because that is how people arrive at it.
 `qmp.cpp` or `debug.cpp`. Triggers on changing the servers or explaining stub
 behavior. Body covers the threading contract (QMP runs on its own thread;
 never touch guest state from it; use the request/poll idiom at
-`dosbox.cpp:474-478`; those drains do not run while GDB-halted unless placed
-above the early return), the address-semantics contract, the exact config
-option names, and a checklist for adding a QMP command that ends at "and a
-conformance test, and a client method, and the skill doc".
+`dosbox.cpp:482-486`; that drain has to be duplicated inside the
+`DEBUG_CheckGDBStep()` branch too (`dosbox.cpp:475-477`), or it silently
+stops running the moment the CPU halts for GDB, per F6), the
+address-semantics contract, the exact config option names, and a checklist
+for adding a QMP command that ends at "and a conformance test, and a client
+method, and the skill doc".
 `references/history.md` carries the bug archaeology so the `FP_SEG` story is
 not re-derived from source a third time.
 
@@ -404,7 +418,15 @@ effort.
 
 ## 9. Out of scope
 
-Protected-mode breakpoint semantics; hardware watchpoints (`Z1`-`Z4`, not
-implemented); binary `X` writes and `qXfer`; the condition-variable path for
-high-rate dumps of a running guest; retiring `dosbox_debug.py`'s callers
+Protected-mode breakpoint semantics (`GetAddress(0, off)` routes through
+`LinMakeProt(0, off)` in protected mode, which rejects selector 0, so a
+GDB-set breakpoint stored against segment 0 never matches there -- this is
+pre-existing, the old packed-far-pointer form was also broken in protected
+mode for a different reason, and the conformance suite asserts real mode
+only); hardware watchpoints (`Z1`-`Z4`, not implemented); binary `X` writes
+and `qXfer`; the condition-variable path for high-rate dumps of a running
+guest; a QMP `system_reset` issued while the CPU is halted for GDB now runs
+instead of sitting pending forever, but the GDB client is not notified, so
+it is left attached to a stale halt against a rebooted memory image --
+notifying it is left for a follow-up; retiring `dosbox_debug.py`'s callers
 outside these three repos, of which there are none known.

@@ -70,17 +70,66 @@ gdb
 | Index | Register |
 |-------|----------|
 | 0-7 | EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI |
-| 8 | EIP (linear address) |
+| 8 | EIP -- an offset within CS, **not** a linear address |
 | 9 | EFLAGS |
 | 10-15 | CS, SS, DS, ES, FS, GS |
+
+Register 8 is EIP exactly as the CPU holds it: an offset within the CS
+segment. To get the linear program counter, compute it yourself as
+`cs * 16 + eip` from registers 10 and 8. Builds that advertise
+`dosbox-x-eip-offset+` in `qSupported` (see [Capability
+Negotiation](#capability-negotiation) below) behave this way. Older builds
+returned `SegPhys(cs) + reg_eip` (a linear value) when reading register 8,
+while writing register 8 still wrote `reg_eip` directly -- so reading `g`
+and writing it back with `G` silently moved the program counter.
+
+Registers can also be written one at a time with `P<n>=<value>`, where `n`
+and `value` are hex and `value` uses the same little-endian-swapped 32-bit
+wire format as `g`/`G`. This is in addition to the existing `p<n>` (read one
+register) and full-register `g`/`G`.
 
 ### Memory Addressing
 
 Addresses are linear physical. For real-mode: `(segment << 4) + offset`.
 
+`m`, `M`, `Z0` and `z0` (read memory, write memory, set breakpoint, remove
+breakpoint) all take this same linear address -- there is no far-pointer
+form for any of them. Builds that advertise `dosbox-x-linear-bp+` in
+`qSupported` (see below) behave this way. Older builds split the `Z0`/`z0`
+argument as a packed far pointer instead (`FP_SEG`/`FP_OFF` on the raw hex
+value), so any breakpoint address at or above `0x10000` answered `OK` but
+never fired; below `0x10000` the two interpretations happen to agree, which
+is why it looked like it worked.
+
+### Capability Negotiation
+
+`qSupported` advertises two vendor feature strings naming the two behaviors
+above:
+
+- `dosbox-x-linear-bp+` -- `Z0`/`z0` take a linear address.
+- `dosbox-x-eip-offset+` -- register 8 is EIP, an offset within CS.
+
+Real GDB ignores vendor features it does not recognize, so both stay
+protocol-legal against any client. A build that does not advertise a
+feature behaves the corresponding older way described above.
+
 ### Limitations
 
 - Software breakpoints only (hardware breakpoints/watchpoints not implemented)
+- Breakpoints set via GDB do not work while the guest is in protected mode.
+  `DEBUG_SetBreakpoint` stores the breakpoint against segment 0, and in
+  protected mode `GetAddress(0, off)` routes through `LinMakeProt(0, off)`,
+  which rejects selector 0 and reports no address -- so the breakpoint is
+  stored but never matches. This is pre-existing (the old packed-far-pointer
+  form was also broken in protected mode, for a different reason), and the
+  conformance suite (`tests/integration/test_gdb_conformance.py`) only
+  asserts real-mode behavior.
+- A QMP `system_reset` issued while the CPU is halted for GDB now actually
+  reboots the guest -- previously the request sat pending forever and never
+  ran. The GDB client is not notified of the reset, so it remains attached
+  to a stale halt against a rebooted memory image; if you issue a reset
+  while stopped at a breakpoint, reconnect afterward rather than trusting
+  the existing session.
 
 ---
 
@@ -165,6 +214,42 @@ When enabled, DOSBox-X will automatically set a breakpoint when DOS loads an EXE
 
 Response: `{"return": {"enabled": true}}`
 
+#### memdump
+
+Dump a range of guest memory to a file:
+
+```json
+{"execute": "memdump", "arguments": {"address": 753664, "size": 4000, "file": "/tmp/screen.bin"}}
+```
+
+- `address`, `size`: decimal, linear address and byte count. `size` is
+  capped at 16 MB.
+- `file`: optional; if omitted, a temp file is created and its path is
+  returned.
+
+**The CPU must be stopped before calling `memdump`.** The handler reads
+guest memory directly from the QMP server thread instead of handing the
+read off to the emulation thread, which is only safe when the emulation
+thread is not executing -- reading live while the guest runs would race it.
+"Stopped" means any of: halted for GDB (Ctrl-C, a breakpoint, or a `?`
+query), paused in the interactive debugger, or paused via a QMP `stop`
+command. Calling `memdump` against a running guest returns an error instead
+of reading:
+
+```json
+{"error": {"class": "GenericError", "desc": "memdump requires the CPU to be stopped for debugging; halt via GDB or QMP stop first"}}
+```
+
+### Pending Work While Halted for GDB
+
+`savestate`/`loadstate`, emulator control (pause/resume/reset), and queued
+keyboard/mouse input from QMP are now serviced while the CPU is halted for
+GDB -- at a breakpoint, after Ctrl-C, or between single steps -- in addition
+to while it runs freely. Previously none of this ran on the halted path: a
+`savestate` issued while stopped at a breakpoint sat until it timed out, and
+`send-key` input typed while halted was silently dropped instead of queuing
+for when execution resumed.
+
 ### Key Names (QKeyCode)
 
 Standard QEMU key names: `a`-`z`, `0`-`9`, `f1`-`f12`, `ret`, `esc`, `tab`, `spc`, `shift`, `ctrl`, `alt`, `caps_lock`, `left`, `right`, `up`, `down`, `insert`, `delete`, `home`, `end`, `pgup`, `pgdn`, `kp_0`-`kp_9`, etc.
@@ -183,7 +268,9 @@ When a breakpoint is hit at program entry:
 - **EXE files**: CS:IP points to segment:0000 (entry at start of code segment)
 - **COM files**: CS:IP points to segment:0100 (code starts after 256-byte PSP)
 
-The segment address varies based on available memory. Use `offset = EIP - (CS * 16)` to calculate the offset within the segment.
+The segment address varies based on available memory. Register 8 (EIP) is
+already the offset within CS -- no further calculation is needed. If you
+want the linear address instead, compute `CS * 16 + EIP`.
 
 ### Option 1: DEBUGBOX Shell Command
 
@@ -220,10 +307,10 @@ Terminal 1 - GDB receives breakpoint:
 (gdb) info registers
 eax    0x0      0
 ...
-eip    0x8240   0x8240    # Linear address
+eip    0x0      0x0       # Offset within CS -- already the entry offset
 cs     0x824    0x824     # Code segment
 ...
-# Offset = 0x8240 - (0x824 * 16) = 0x0000 (EXE entry point)
+# Linear address = CS * 16 + EIP = 0x824 * 16 + 0x0 = 0x8240 (EXE entry point)
 ```
 
 ### Option 2: QMP debug-break-on-exec
@@ -331,6 +418,25 @@ print(gdb.recv(4096))
 
 ## Python Automation Library
 
+> **Deprecated.** `tests/integration/dosbox_debug.py` is kept only for
+> backward compatibility during this stage -- an external project still
+> imports `GDBClient`/`QMPClient` from it by path. It is not the
+> recommended way to automate DOSBox-X going forward:
+>
+> - For automation, use `dbxdebug` (the packaged replacement for this
+>   module) once it ships.
+> - For in-repo conformance work, use the protocol clients under
+>   `tests/integration/protocol/` (`protocol/gdb.py`, `protocol/qmp.py`),
+>   which back `test_gdb_conformance.py` and `test_qmp_conformance.py`.
+>
+> `dosbox_debug.py` itself is scheduled for removal once `dbxdebug` ships.
+> It did get one behavior change in this stage: `GDBClient.set_breakpoint()`
+> and `.remove_breakpoint()` now reject any address `>= 0x110000` with
+> `PackedAddressError`, on the assumption that it is a packed
+> `(seg << 16) | off` far pointer left over from before `Z0`/`z0` took
+> linear addresses -- real-mode linear addresses, including the HMA, stay
+> below that boundary.
+
 The `tests/integration/dosbox_debug.py` module provides high-level Python classes for automating DOSBox-X:
 
 - **`DOSBoxInstance`** - Launch and manage DOSBox-X processes
@@ -425,18 +531,22 @@ def main():
         time.sleep(0.2)
 
         # Read registers at entry point
+        # NOTE: regs.eip is EIP as the CPU holds it -- an offset within CS,
+        # not a linear address. Compute the linear PC yourself.
         regs = dbx.gdb.read_registers()
         print(f"5. At program entry point:")
-        print(f"   EIP = 0x{regs.eip:08X}")
+        print(f"   EIP = 0x{regs.eip:08X}  (offset within CS)")
         print(f"   CS  = 0x{regs.cs:04X}")
 
-        # Calculate segment offset
-        offset = regs.eip - (regs.cs * 16)
-        print(f"   Offset within segment: 0x{offset:04X}")
+        linear_pc = regs.cs * 16 + regs.eip
+        print(f"   Linear PC: 0x{linear_pc:08X}")
 
-        # Set a breakpoint a few instructions ahead
-        # (EIP + 0x10 is arbitrary - adjust for your program)
-        breakpoint_addr = regs.eip + 0x10
+        # Set a breakpoint a few instructions ahead.
+        # Breakpoint addresses are linear (this is what set_breakpoint
+        # expects, and what its packed-far-pointer guard checks against),
+        # so build it from the linear PC, not from EIP alone.
+        # (+ 0x10 is arbitrary - adjust for your program)
+        breakpoint_addr = linear_pc + 0x10
         print(f"\n6. Setting breakpoint at 0x{breakpoint_addr:08X}...")
         success = dbx.gdb.set_breakpoint(breakpoint_addr)
         print(f"   Breakpoint set: {success}")
@@ -454,11 +564,15 @@ def main():
 
             # Read registers at breakpoint
             regs = dbx.gdb.read_registers()
+            linear_pc = regs.cs * 16 + regs.eip
             print(f"\n9. Breakpoint hit!")
-            print(f"   EIP = 0x{regs.eip:08X}")
+            print(f"   EIP = 0x{regs.eip:08X}  (offset within CS)")
+            print(f"   Linear PC = 0x{linear_pc:08X}")
 
-            # Read some memory at current location
-            mem = dbx.gdb.read_memory(regs.eip, 8)
+            # Read some memory at current location.
+            # read_memory takes a linear address, so use linear_pc, not
+            # regs.eip alone.
+            mem = dbx.gdb.read_memory(linear_pc, 8)
             print(f"   Bytes at EIP: {mem.hex()}")
         else:
             print("   Timeout waiting for breakpoint")
@@ -489,7 +603,7 @@ gdb.wait_for_stop(timeout=5.0)         # Wait for S05 stop reply
 
 # Registers
 gdb.read_registers()                   # Read all registers -> Registers dataclass
-gdb.read_register(8)                   # Read single register by index (8=EIP)
+gdb.read_register(8)                   # Read single register by index (8=EIP, offset within CS)
 
 # Memory
 gdb.read_memory(0xB8000, 100)          # Read bytes from linear address
