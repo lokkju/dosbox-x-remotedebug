@@ -1570,8 +1570,9 @@ In `src/debug/qmp.cpp`, in `handle_memdump`, replace the call to `DEBUG_SaveMemo
      * deliberately not built yet: the existing SAVESTATE_* idiom polls at
      * 100ms, which would destroy the 30-60Hz use case this command exists
      * for, and dumping a RUNNING guest at that rate has no measured
-     * consumer. See section 3.1 of the Stage 1 design spec. */
-    if (!DEBUG_IsCpuPausedForDebug()) {
+     * consumer. See section 3.1 of
+     * docs/superpowers/specs/2026-09-03-dosbox-debug-harness-design.md. */
+    if (!DEBUG_IsCpuPausedForDebug() && !EMULATOR_IsPaused()) {
         if (use_temp) unlink(filepath.c_str());
         send_error("GenericError",
                    "memdump requires the CPU to be stopped for debugging; "
