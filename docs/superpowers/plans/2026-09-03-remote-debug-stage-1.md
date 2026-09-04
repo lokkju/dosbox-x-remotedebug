@@ -23,9 +23,11 @@
 
 ## Notes for the implementer
 
-**Rebuilds are slow.** Tasks 4-7 each change C++ and need `./build-debug --enable-remotedebug` before their tests can pass. Budget for it; do not skip the build and assume.
+**Rebuilds are slow.** Tasks 4-8 each change C++ and need `./build-debug --enable-remotedebug` before their tests can pass. Budget for it; do not skip the build and assume.
 
-**Two register-layout facts you will need.** The `g`/`G` packets use 16 registers, 4 bytes each, little-endian hex, in the order EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI, EIP, EFLAGS, CS, SS, DS, ES, FS, GS (`gdbserver.cpp:379`). Register 8 is asymmetric: reading returns `SegPhys(cs) + reg_eip`, a **linear** PC, while writing sets `reg_eip`, an **offset** (`debug.cpp:6133` versus `:6155`). A blind `g` then `G` round-trip therefore corrupts EIP. Do not do one. This asymmetry is out of scope for Stage 1 — file it as a Beads issue in Task 12 rather than fixing it here.
+**The register layout.** The `g`/`G` packets use 16 registers, 4 bytes each, little-endian hex, in the order EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI, EIP, EFLAGS, CS, SS, DS, ES, FS, GS (`gdbserver.cpp:379`). Register 8 is EIP.
+
+Before Task 4 it is asymmetric: reading returns `SegPhys(cs) + reg_eip`, a **linear** PC, while writing sets `reg_eip`, an **offset** (`debug.cpp:6133` versus `:6155`), so a `g` then `G` round-trip corrupts EIP. Task 4 makes reading return `reg_eip`. After it, the linear PC is `registers[10] * 16 + registers[8]` — compute it, never read register 8 as one.
 
 **Why `AddBreakpoint(0, linear, false)` is exact.** `GetAddress(seg, off)` returns `((uint64_t)seg << 4) + offset` in real mode (`debug.cpp:450`), so segment zero makes the stored `location` equal to `linear`. `CheckBreakpoint` compares that against `GetAddress(SegValue(cs), reg_eip)`, which is the true physical PC. Any `seg:off` pair naming the byte fires.
 
@@ -349,7 +351,7 @@ class RawGDB:
 Run: `uv run tests/integration/test_protocol_gdb_unit.py -v`
 Expected: PASS, 6 tests.
 
-Note `P` is used by `write_register` but is not in the stub's dispatch (`gdbserver.cpp:305-338` handles `p` but not `P`). Task 4's conformance test asserts that, and Task 4 adds `P` if it is missing. Do not add it here.
+Note `write_register` sends `P`, which the stub's dispatch does not currently handle (`gdbserver.cpp:305-338` has `p` but not `P`). Task 4 adds it. Do not add it here — the unit tests in this task never touch a socket.
 
 - [ ] **Step 6: Commit**
 
@@ -929,7 +931,193 @@ EOF
 
 ---
 
-### Task 4: Linear breakpoint addresses
+### Task 4: Register conformance — the `P` packet and EIP
+
+Two RSP conformance defects in the register interface, fixed together because
+the second is only testable through the first.
+
+`DEBUG_GetRegister(8)` returns `SegPhys(cs) + reg_eip`, a linear PC, while
+`DEBUG_SetRegister(8)` writes `reg_eip`, an offset (`debug.cpp:6133` versus
+`:6155`). The GDB remote serial protocol defines register 8 as **EIP**, so
+reporting a linear address is non-conformant in the same way `Z0` is: real
+`gdb` would display a wrong `$pc` and every `$pc`-relative expression would be
+wrong. It also makes `g` then `G` corrupt EIP.
+
+The stub also has no `P` packet, so a client cannot write one register without
+a full `G` — which, given the asymmetry, is exactly the corrupting operation.
+
+**Files:**
+- Modify: `src/debug/debug.cpp:6133`
+- Modify: `src/debug/gdbserver.cpp` (dispatch chain, and a new handler)
+- Modify: `include/gdbserver.h`
+- Test: `tests/integration/test_gdb_conformance.py`
+
+**Interfaces:**
+- Consumes: `RawGDB`, the `gdb` fixture.
+- Produces: register 8 is EIP. Later tasks compute the linear PC as
+  `registers[10] * 16 + registers[8]`. The `P<n>=<value>` packet writes one
+  register and answers `OK`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/test_gdb_conformance.py`:
+
+```python
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest>=8.0",
+# ]
+# ///
+"""Conformance tests for the GDB stub.
+
+These assert what the SERVER does. Each gets a fresh emulator because they
+halt the CPU, write guest memory and move the program counter.
+
+Register 8 is EIP, an offset within CS. The linear PC is
+registers[10] * 16 + registers[8].
+"""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+CS = 10
+EIP = 8
+
+
+def linear_pc(registers: list) -> int:
+    return registers[CS] * 16 + registers[EIP]
+
+
+def test_p_packet_writes_a_single_register(gdb):
+    """Without P a client must use G, which rewrites all sixteen registers
+    at once -- and G is exactly the operation the EIP asymmetry corrupts."""
+    gdb.halt()
+    assert gdb.write_register(3, 0x1234) is True, (
+        "the stub did not accept a P packet")
+    assert gdb.read_registers()[3] == 0x1234
+
+
+def test_register_eight_is_eip_not_a_linear_address(gdb):
+    """RSP defines register 8 as EIP. Reporting SegPhys(cs)+reg_eip is the
+    same class of non-conformance as a packed Z0 argument: real gdb shows a
+    wrong $pc and every $pc-relative expression is wrong."""
+    gdb.halt()
+    regs = gdb.read_registers()
+    assert regs[EIP] <= 0xFFFF, (
+        f"register 8 read back as 0x{regs[EIP]:X}, which is outside a 16-bit "
+        f"offset -- the stub is still reporting a linear PC")
+
+
+def test_writing_eip_then_reading_it_round_trips(gdb):
+    """The asymmetry meant a g/G round-trip silently moved the PC."""
+    gdb.halt()
+    before = gdb.read_registers()
+    assert gdb.write_register(EIP, before[EIP]) is True
+    after = gdb.read_registers()
+    assert after[EIP] == before[EIP]
+    assert linear_pc(after) == linear_pc(before)
+
+
+def test_the_linear_pc_points_at_executable_memory(gdb):
+    """Cross-check that cs * 16 + eip names a byte the m packet can read."""
+    gdb.halt()
+    regs = gdb.read_registers()
+    assert len(gdb.read_memory(linear_pc(regs), 1)) == 1
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `uv run --with pytest pytest tests/integration/test_gdb_conformance.py -v`
+Expected: FAIL. `test_p_packet_writes_a_single_register` fails because the stub
+answers an empty packet to `P`. `test_register_eight_is_eip_not_a_linear_address`
+fails with a value well above `0xFFFF`.
+
+- [ ] **Step 3: Add the `P` packet handler**
+
+In `src/debug/gdbserver.cpp`, in the dispatch chain, immediately after the
+`} else if (cmd.substr(0, 1) == "p") {` branch, add:
+
+```c
+    } else if (cmd.substr(0, 1) == "P") {
+        handle_write_register(cmd.substr(1));
+```
+
+Declare it in `include/gdbserver.h` beside `handle_write_registers`:
+
+```c
+    void handle_write_register(const std::string& args);
+```
+
+Define it in `src/debug/gdbserver.cpp` next to `handle_write_registers`:
+
+```c
+void GDBServer::handle_write_register(const std::string& args) {
+    size_t eq = args.find('=');
+    if (eq == std::string::npos) {
+        send_packet("E01");
+        return;
+    }
+    int reg = (int)std::stoul(args.substr(0, eq), nullptr, 16);
+    uint32_t value = (uint32_t)std::stoul(args.substr(eq + 1), nullptr, 16);
+    DEBUG_SetRegister(reg, swap32(value));
+    send_packet("OK");
+}
+```
+
+- [ ] **Step 4: Make register 8 report EIP**
+
+In `src/debug/debug.cpp`, in `DEBUG_GetRegister`, change case 8:
+
+```c
+         /* RSP register 8 is EIP -- an offset within CS, not a linear
+          * address. This used to return SegPhys(cs) + reg_eip, which made
+          * real gdb display a wrong $pc and made a g/G round-trip corrupt
+          * EIP, because DEBUG_SetRegister(8) has always written reg_eip.
+          * Clients wanting the linear PC compute cs * 16 + eip. */
+         case 8: return reg_eip;
+```
+
+- [ ] **Step 5: Rebuild and run the test**
+
+Run: `./build-debug --enable-remotedebug`
+Then: `uv run --with pytest pytest tests/integration/test_gdb_conformance.py -v`
+Expected: PASS, 4 tests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/debug/debug.cpp src/debug/gdbserver.cpp include/gdbserver.h tests/integration/test_gdb_conformance.py
+git commit -F - <<'EOF'
+fix(gdbserver): report EIP in register 8 and add the P packet
+
+RSP defines register 8 as EIP, an offset within CS. DEBUG_GetRegister
+returned SegPhys(cs) + reg_eip, a linear address, while DEBUG_SetRegister
+has always written reg_eip. Real gdb therefore displayed a wrong $pc and
+got wrong results from every $pc-relative expression, and a g then G
+round-trip silently moved the program counter.
+
+Register 8 now reports reg_eip. A client wanting the linear PC computes
+cs * 16 + eip from registers 10 and 8.
+
+Adds the P packet so one register can be written without a full G, which
+was the only way to set CS or EIP and was itself the corrupting
+operation.
+EOF
+```
+
+---
+
+### Task 5: Linear breakpoint addresses
 
 The core fix. `gdbserver.cpp:448` hands the `Z0` argument to `DEBUG_SetBreakpoint`, which splits it as a far pointer, while `m` treats the same form as linear. Breakpoints above `0x10000` answer `OK` and never fire.
 
@@ -945,29 +1133,9 @@ The core fix. `gdbserver.cpp:448` hands the `Z0` argument to `DEBUG_SetBreakpoin
 
 The test writes a two-byte infinite loop (`EB FE`, `jmp $`) at linear `0x30000`, points the CPU at it, sets a breakpoint on that linear address and continues. Under the old code `Z0,30000,1` decodes as segment `0x0003`, offset `0x0000`, so the breakpoint lands at physical `0x30` and never fires. Corrupting memory at `0x30000` and hijacking the PC is fine — the emulator is destroyed when the fixture exits.
 
+Append to `tests/integration/test_gdb_conformance.py`, which Task 4 created:
+
 ```python
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#     "pytest>=8.0",
-# ]
-# ///
-"""Conformance tests for the GDB stub.
-
-These assert what the SERVER does. Each gets a fresh emulator because they
-halt the CPU, write guest memory and move the program counter.
-"""
-
-import sys
-from pathlib import Path
-
-import pytest
-
-sys.path.insert(0, str(Path(__file__).parent))
-
-from protocol.gdb import GDBProtocolError  # noqa: F401  (used by other tests)
-
 # A linear address comfortably above 0x10000, which is where the packed and
 # linear interpretations of a Z0 argument stop coinciding.
 LOOP_ADDR = 0x30000
@@ -977,8 +1145,8 @@ JMP_SELF = b"\xeb\xfe"
 def _park_cpu_in_a_loop(gdb, addr: int = LOOP_ADDR) -> None:
     """Halt, plant `jmp $` at `addr`, and point CS:IP at it.
 
-    Register 8 is asymmetric -- reading gives SegPhys(cs)+eip, writing sets
-    eip -- so CS and EIP are written separately and never round-tripped.
+    CS and EIP are written separately via P. There is no single register
+    holding a linear PC to write.
     """
     gdb.halt()
     assert gdb.write_memory(addr, JMP_SELF) is True
@@ -1005,8 +1173,8 @@ def test_breakpoint_above_64k_fires_at_the_linear_address(gdb):
         f"The stub is interpreting the Z0 argument as a packed far pointer.")
 
     regs = gdb.read_registers()
-    assert regs[8] == LOOP_ADDR, (
-        f"stopped at 0x{regs[8]:X}, expected 0x{LOOP_ADDR:X}")
+    assert linear_pc(regs) == LOOP_ADDR, (
+        f"stopped at 0x{linear_pc(regs):X}, expected 0x{LOOP_ADDR:X}")
 
 
 def test_breakpoint_and_memory_agree_on_what_an_address_is(gdb):
@@ -1017,7 +1185,7 @@ def test_breakpoint_and_memory_agree_on_what_an_address_is(gdb):
     gdb.cont()
     assert gdb.wait_for_stop(timeout=15.0).startswith("S05")
     regs = gdb.read_registers()
-    assert gdb.read_memory(regs[8], 2) == JMP_SELF
+    assert gdb.read_memory(linear_pc(regs), 2) == JMP_SELF
 
 
 def test_removing_a_breakpoint_lets_execution_continue(gdb):
@@ -1030,16 +1198,12 @@ def test_removing_a_breakpoint_lets_execution_continue(gdb):
     gdb.cont()
     assert gdb.wait_for_stop(timeout=3.0) == "", (
         "execution stopped again after the breakpoint was removed")
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest pytest tests/integration/test_gdb_conformance.py -v`
-Expected: FAIL — `test_breakpoint_above_64k_fires_at_the_linear_address` reports "never fired (got '')". If `write_register` fails with an empty reply, the stub has no `P` packet; go to Step 3b.
+Expected: FAIL — `test_breakpoint_above_64k_fires_at_the_linear_address` reports "never fired (got '')". The four tests from Task 4 still pass.
 
 - [ ] **Step 3: Fix the breakpoint address interpretation**
 
@@ -1068,41 +1232,16 @@ In `src/debug/debug.cpp`, replace lines 6253-6267 (the `FP_SEG`/`FP_OFF` macros 
 
 Note `AddBreakpoint` returns `CBreakpoint*`, so the comparison against `NULL` is required to keep the `bool` return; the old code relied on an implicit pointer-to-bool conversion.
 
-- [ ] **Step 3b: Add the `P` packet if the stub lacks it**
-
-`gdbserver.cpp` handles `p` (read one register) but not `P` (write one). If Step 2 showed `write_register` returning an empty reply, add a handler. In `src/debug/gdbserver.cpp`, in the dispatch chain, immediately after the `} else if (cmd.substr(0, 1) == "p") {` branch, add:
-
-```c
-    } else if (cmd.substr(0, 1) == "P") {
-        handle_write_register(cmd.substr(1));
-```
-
-Declare `void handle_write_register(const std::string& args);` in `include/gdbserver.h` beside `handle_write_registers`, and define it next to `handle_write_registers` in `src/debug/gdbserver.cpp`:
-
-```c
-void GDBServer::handle_write_register(const std::string& args) {
-    size_t eq = args.find('=');
-    if (eq == std::string::npos) {
-        send_packet("E01");
-        return;
-    }
-    int reg = (int)std::stoul(args.substr(0, eq), nullptr, 16);
-    uint32_t value = (uint32_t)std::stoul(args.substr(eq + 1), nullptr, 16);
-    DEBUG_SetRegister(reg, swap32(value));
-    send_packet("OK");
-}
-```
-
 - [ ] **Step 4: Rebuild and run the test**
 
 Run: `./build-debug --enable-remotedebug`
 Then: `uv run --with pytest pytest tests/integration/test_gdb_conformance.py -v`
-Expected: PASS, 3 tests.
+Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/debug/debug.cpp src/debug/gdbserver.cpp include/gdbserver.h tests/integration/test_gdb_conformance.py
+git add src/debug/debug.cpp tests/integration/test_gdb_conformance.py
 git commit -F - <<'EOF'
 fix(gdbserver): make Z0 and z0 take a linear address
 
@@ -1128,9 +1267,9 @@ EOF
 
 ---
 
-### Task 5: Advertise the fix through `qSupported`
+### Task 6: Advertise both semantics changes through `qSupported`
 
-Clients need to tell a fixed stub from an old one. `Z0` answers `OK` either way, so without this the change is silent in both directions.
+Clients need to tell a fixed stub from an old one. `Z0` answers `OK` whichever way it reads its argument, and register 8 returns a plausible-looking number under either interpretation, so neither change is detectable by probing. Both get a vendor feature.
 
 **Files:**
 - Modify: `src/debug/gdbserver.cpp:467`
@@ -1138,7 +1277,7 @@ Clients need to tell a fixed stub from an old one. `Z0` answers `OK` either way,
 
 **Interfaces:**
 - Consumes: the `gdb` fixture.
-- Produces: the wire feature string `dosbox-x-linear-bp+`, which dbxdebug checks at connect in Stage 2.
+- Produces: the wire feature strings `dosbox-x-linear-bp+` and `dosbox-x-eip-offset+`, which dbxdebug checks at connect in Stage 2.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1153,6 +1292,14 @@ def test_qsupported_advertises_linear_breakpoints(gdb):
         f"qSupported did not advertise linear breakpoints: {features!r}")
 
 
+def test_qsupported_advertises_eip_as_an_offset(gdb):
+    """Register 8 returns a plausible number under either interpretation, so
+    a client that guesses wrong computes a wrong PC and never finds out."""
+    features = gdb.supported()
+    assert "dosbox-x-eip-offset+" in features, (
+        f"qSupported did not advertise EIP semantics: {features!r}")
+
+
 def test_qsupported_still_advertises_the_stock_features(gdb):
     features = gdb.supported()
     for feature in ("PacketSize=", "swbreak+", "hwbreak+",
@@ -1163,7 +1310,7 @@ def test_qsupported_still_advertises_the_stock_features(gdb):
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `uv run --with pytest pytest tests/integration/test_gdb_conformance.py -v -k qsupported`
-Expected: FAIL on `test_qsupported_advertises_linear_breakpoints`; the second test passes.
+Expected: FAIL on `test_qsupported_advertises_linear_breakpoints` and `test_qsupported_advertises_eip_as_an_offset`; `test_qsupported_still_advertises_the_stock_features` passes.
 
 - [ ] **Step 3: Add the vendor feature**
 
@@ -1171,42 +1318,49 @@ In `src/debug/gdbserver.cpp`, in `handle_query`, replace the `qSupported` reply:
 
 ```c
     if (cmd.substr(0, 10) == "Supported:") {
-        /* dosbox-x-linear-bp+ is a vendor feature. It tells a client that
-         * Z0/z0 take a LINEAR address, as the protocol specifies, rather
-         * than the packed far pointer older builds expected. Real gdb
-         * ignores features it does not recognise, so this stays RSP-legal.
-         * Clients need it because Z0 answers OK under either reading. */
+        /* Two vendor features naming the two semantics this build fixed.
+         * dosbox-x-linear-bp+ : Z0/z0 take a LINEAR address, as the
+         *   protocol specifies, not the packed far pointer older builds
+         *   expected. Needed because Z0 answers OK under either reading.
+         * dosbox-x-eip-offset+ : register 8 is EIP, an offset within CS,
+         *   not SegPhys(cs)+reg_eip. Needed because either interpretation
+         *   yields a plausible-looking number.
+         * Real gdb ignores features it does not recognise, so both stay
+         * RSP-legal. */
         send_packet("PacketSize=3fff;swbreak+;hwbreak+;vContSupported+;"
-                    "QStartNoAckMode+;dosbox-x-linear-bp+");
+                    "QStartNoAckMode+;dosbox-x-linear-bp+;"
+                    "dosbox-x-eip-offset+");
 ```
 
 - [ ] **Step 4: Rebuild and run the test**
 
 Run: `./build-debug --enable-remotedebug`
 Then: `uv run --with pytest pytest tests/integration/test_gdb_conformance.py -v`
-Expected: PASS, 5 tests.
+Expected: PASS, 10 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/debug/gdbserver.cpp tests/integration/test_gdb_conformance.py
 git commit -F - <<'EOF'
-feat(gdbserver): advertise dosbox-x-linear-bp+ in qSupported
+feat(gdbserver): advertise the fixed semantics in qSupported
 
-Z0 answers OK whether it reads its argument as linear or as a packed far
-pointer, so a client cannot detect which semantics a build has by
-probing. Without an advertisement the change is silent in both
-directions: a new client against an old stub, and an old client against
-a new one, both set breakpoints that never fire.
+Neither change this branch makes is detectable by probing. Z0 answers OK
+whether it reads its argument as linear or as a packed far pointer, and
+register 8 returns a plausible number whether it holds EIP or a linear
+PC. Without an advertisement both are silent in both directions: a new
+client against an old stub and an old client against a new one each
+compute wrong addresses and never find out.
 
-Real gdb ignores qSupported features it does not recognise, so the
-vendor feature is protocol-legal.
+dosbox-x-linear-bp+ names the Z0/z0 contract, dosbox-x-eip-offset+ the
+register 8 contract. Real gdb ignores qSupported features it does not
+recognise, so both are protocol-legal.
 EOF
 ```
 
 ---
 
-### Task 6: Service pending QMP work while halted for GDB
+### Task 7: Service pending QMP work while halted for GDB
 
 `DEBUG_CheckGDBStep()` returns true while `gdb_cpu_paused`, and `Normal_Loop` returns at `dosbox.cpp:471` — before the drains at `:474-478`. So while stopped at a breakpoint, `savestate` waits its full 30 second timeout and errors, and queued keystrokes are never delivered.
 
@@ -1331,7 +1485,7 @@ EOF
 
 ---
 
-### Task 7: Close the `memdump` race
+### Task 8: Close the `memdump` race
 
 `memdump` is the only QMP handler that touches guest state from the socket thread; every other one defers to the emulation thread. When the CPU is provably stopped nothing is mutating memory, so a direct read is safe.
 
@@ -1402,7 +1556,7 @@ In `src/debug/qmp.cpp`, in `handle_memdump`, replace the call to `DEBUG_SaveMemo
      * deliberately not built yet: the existing SAVESTATE_* idiom polls at
      * 100ms, which would destroy the 30-60Hz use case this command exists
      * for, and dumping a RUNNING guest at that rate has no measured
-     * consumer. See the Stage 1 plan and DBX ticket for memdump-while-running. */
+     * consumer. See section 3.1 of the Stage 1 design spec. */
     if (!DEBUG_IsCpuPausedForDebug()) {
         if (use_temp) unlink(filepath.c_str());
         send_error("GenericError",
@@ -1470,9 +1624,9 @@ EOF
 
 ---
 
-### Task 8: Cover the rest of the QMP dispatch
+### Task 9: Cover the rest of the QMP dispatch
 
-`qmp.cpp:404` dispatches twelve commands. Tasks 6 and 7 cover four. Assert the rest answer, so a future refactor cannot quietly drop one.
+`qmp.cpp:404` dispatches twelve commands. Tasks 7 and 8 cover four. Assert the rest answer, so a future refactor cannot quietly drop one.
 
 **Files:**
 - Modify: `tests/integration/test_qmp_conformance.py`
@@ -1550,7 +1704,7 @@ git commit -m "test: cover the remaining QMP dispatch entries"
 
 ---
 
-### Task 9: Pin the config option names
+### Task 10: Pin the config option names
 
 `gdbport`/`qmpport` are not options. Writing them means the server silently falls back to 2159/4444 and a client connects to somebody else's emulator.
 
@@ -1653,7 +1807,7 @@ git commit -m "test: pin the gdbserver/qmpserver port option names"
 
 ---
 
-### Task 10: Rebase the surviving behavioral tests
+### Task 11: Rebase the surviving behavioral tests
 
 `test_video_tools.py` imports `DOSVideoTools`, which does not exist in `dosbox_debug.py` — the file cannot be collected today. `run_all.py` declares a `dbxdebug>=0.2.1` PEP 723 dependency that nothing imports, which violates the licensing constraint even unused.
 
@@ -1754,7 +1908,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Rebase test_debugbox.py onto the fixtures**
 
-`test_debugbox.py:31` imports `DOSBoxInstance, GDBClient, QMPClient` from `dosbox_debug`. Replace that import and any `DOSBoxInstance(...)` construction with the `emulator`, `gdb` and `qmp` fixtures from `conftest.py`, and replace `dosbox_debug` method calls with their `RawGDB`/`RawQMP` equivalents: `read_registers()` now returns a list of 16 ints rather than a `Registers` object, so index it (register 8 is the linear PC, 10 is CS, 12 is DS). Leave the DEBUGBOX behavior each test asserts unchanged.
+`test_debugbox.py:31` imports `DOSBoxInstance, GDBClient, QMPClient` from `dosbox_debug`. Replace that import and any `DOSBoxInstance(...)` construction with the `emulator`, `gdb` and `qmp` fixtures from `conftest.py`, and replace `dosbox_debug` method calls with their `RawGDB`/`RawQMP` equivalents: `read_registers()` now returns a list of 16 ints rather than a `Registers` object, so index it (register 8 is EIP, 10 is CS, 12 is DS; the linear PC is `regs[10] * 16 + regs[8]`). Leave the DEBUGBOX behavior each test asserts unchanged.
 
 - [ ] **Step 5: Update the README**
 
@@ -1788,7 +1942,7 @@ EOF
 
 ---
 
-### Task 11: Deprecate `dosbox_debug.py` and guard packed addresses
+### Task 12: Deprecate `dosbox_debug.py` and guard packed addresses
 
 The file stays until Stage 2 ships `dbxdebug`, because `powerbasic-decompile` imports its clients by path. But its consumers pack `(seg << 16) | off`, which is correct against the old stub and wrong from Task 4 onwards.
 
@@ -1962,11 +2116,10 @@ EOF
 
 ---
 
-### Task 12: Documentation and follow-up tickets
+### Task 13: Documentation
 
 **Files:**
 - Modify: `docs/REMOTEDEBUG.md`
-- Beads: new issues
 
 **Interfaces:**
 - Consumes: nothing.
@@ -1976,6 +2129,10 @@ EOF
 
 In `docs/REMOTEDEBUG.md`, find the "Memory Addressing" section (around line 77) and the "Limitations" section (around line 81). State that `m`, `M`, `Z0` and `z0` all take linear addresses; that a `seg:off` pair converts as `seg * 16 + off`; and that builds advertising `dosbox-x-linear-bp+` in `qSupported` have this behavior while older ones split the `Z0` argument as a far pointer and silently fail above 64 KB.
 
+- [ ] **Step 1b: Document the register layout**
+
+In the "Register Mapping" section (around line 68), state the `g`/`G` order and that **register 8 is EIP, an offset within CS** — the linear PC is `cs * 16 + eip` from registers 10 and 8. Note that builds advertising `dosbox-x-eip-offset+` behave this way, and that older ones returned `SegPhys(cs) + reg_eip` there, which made `g`/`G` round-trips move the program counter. Document the `P<n>=<value>` packet alongside `p`.
+
 - [ ] **Step 2: Correct the Python examples**
 
 The "Python Automation Library" section (around line 332) documents `DOSBoxInstance`, `GDBClient` and `QMPClient` from `dosbox_debug`. Add a note at the head of that section marking it deprecated, pointing at `dbxdebug` for automation and at `tests/integration/protocol/` for in-repo conformance work. Do not delete the examples — the module still exists this stage.
@@ -1984,17 +2141,14 @@ The "Python Automation Library" section (around line 332) documents `DOSBoxInsta
 
 Add to the QMP `memdump` documentation that the CPU must be stopped for debugging, and why: the command reads guest memory from the QMP thread, which is only safe when the emulation thread is not executing.
 
-- [ ] **Step 4: File the follow-up tickets**
+- [ ] **Step 4: Record the one deferred item in the spec**
 
-```bash
-bd create "Fix g/G register asymmetry on EIP" \
-  -d "DEBUG_GetRegister(8) returns SegPhys(cs)+reg_eip, a linear PC, while DEBUG_SetRegister(8) writes reg_eip, an offset (debug.cpp:6133 vs :6155). A g then G round-trip therefore corrupts EIP. Out of scope for the Stage 1 PR; the conformance client works around it by writing CS and EIP separately via P." \
-  -p 2 -t bug
-
-bd create "Deferred memdump path for a running guest" \
-  -d "memdump now refuses unless the CPU is stopped for debugging. A request/response marshal to the emulation thread with condition-variable signalling would let a running guest be dumped race-free, but the existing SAVESTATE_* idiom polls at 100ms which would defeat the 30-60Hz use case. Build when a consumer needs it. See docs/superpowers/specs/2026-09-03-dosbox-debug-harness-design.md section 3.1." \
-  -p 3 -t feature
-```
+The g/G asymmetry is fixed in Task 4, so the only thing left deferred is the
+running-guest `memdump` path. Section 9 of
+`docs/superpowers/specs/2026-09-03-dosbox-debug-harness-design.md` already
+lists it as out of scope; confirm that entry reads correctly against what
+Task 8 actually shipped, and correct it if not. Do not open a tracker issue
+— see Task 14.
 
 - [ ] **Step 5: Run the full suite one last time**
 
@@ -2004,28 +2158,119 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add docs/REMOTEDEBUG.md .beads/issues.jsonl
+git add docs/REMOTEDEBUG.md docs/superpowers/specs/2026-09-03-dosbox-debug-harness-design.md
 git commit -F - <<'EOF'
-docs: correct the remote debug addressing rules
+docs: correct the remote debug addressing and register rules
 
-m, M, Z0 and z0 all take linear addresses now. Records that builds
-advertising dosbox-x-linear-bp+ in qSupported behave this way, and that
-older ones split the Z0 argument as a far pointer and fail silently
-above 64 KB.
+m, M, Z0 and z0 all take linear addresses now, and register 8 is EIP
+rather than a linear PC. Records that builds advertising
+dosbox-x-linear-bp+ and dosbox-x-eip-offset+ behave this way, and what
+older ones did instead -- a packed far pointer for Z0, and
+SegPhys(cs)+reg_eip for register 8, each failing silently.
 
-Marks the dosbox_debug.py section deprecated in favour of dbxdebug, and
-documents that memdump requires the CPU to be stopped.
+Documents the new P packet, marks the dosbox_debug.py section deprecated
+in favour of dbxdebug, and records that memdump requires the CPU to be
+stopped.
 EOF
 ```
 
 ---
 
+---
+
+### Task 14: Stop tracking the Beads database
+
+37 of this branch's 68 commits touch `.beads/`, because a `pre-commit` hook
+flushes and stages `.beads/issues.jsonl` on every commit. An upstream reviewer
+looking at a GDB protocol fix should not find a project-management database in
+the diff.
+
+**Scope is narrow: stop tracking it and stop the hook. Do not migrate to a
+replacement tracker** — that is a separate decision, out of scope here.
+
+**Files:**
+- Modify: `.gitignore`
+- Modify: `CLAUDE.md`
+- Delete from the index (not from disk): `.beads/`
+- Remove: `.git/hooks/pre-commit`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: nothing.
+
+- [ ] **Step 1: Confirm what is tracked and what the hook does**
+
+Run:
+```bash
+git ls-files .beads
+head -20 .git/hooks/pre-commit
+```
+Expected: five tracked files under `.beads/`, and a hook whose comment says it
+flushes pending bd issue changes to `.beads/issues.jsonl` before the commit.
+
+- [ ] **Step 2: Disable the hook**
+
+The hook lives in `.git/hooks/`, which is not tracked, so this is a local
+change and not part of the commit:
+
+```bash
+mv .git/hooks/pre-commit .git/hooks/pre-commit.beads.disabled
+```
+
+- [ ] **Step 3: Untrack the database, keeping it on disk**
+
+```bash
+git rm -r --cached .beads
+echo "" >> .gitignore
+echo "# Beads issue database: local tooling, not part of the source tree" >> .gitignore
+echo ".beads/" >> .gitignore
+```
+
+`--cached` is required. Without it this deletes the issue history from disk,
+which is not recoverable from git once the commit lands.
+
+- [ ] **Step 4: Update the project instructions**
+
+In `CLAUDE.md`, replace the "IMPORTANT: Issue Tracking" section. Beads is no
+longer the project's tracker and its database is no longer in the repository.
+State that issue tracking has moved out of the repository and that `.beads/`
+is ignored. Do not name a replacement — none has been chosen.
+
+- [ ] **Step 5: Verify nothing else regressed**
+
+```bash
+git status --short
+uv run tests/integration/run_all.py -v
+```
+Expected: `.beads/` files staged as deletions, `.gitignore` and `CLAUDE.md`
+modified, and the suite still passing. `.beads/` must still exist on disk.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add .gitignore CLAUDE.md
+git commit -F - <<'EOF'
+chore: stop tracking the Beads issue database
+
+The pre-commit hook flushed and staged .beads/issues.jsonl on every
+commit, so 37 of this branch's 68 commits carry project-management churn
+alongside their actual change. That is noise in any review and
+particularly so upstream, where a GDB protocol fix should not ship a
+task database.
+
+The directory stays on disk and is now ignored. This does not choose a
+replacement tracker; that is a separate decision.
+EOF
+```
+
 ## Stage 1 exit criteria
 
 - `uv run tests/integration/run_all.py` passes with no third-party imports beyond pytest.
 - A breakpoint set at a linear address above `0x10000` fires there.
-- `qSupported` advertises `dosbox-x-linear-bp+`.
+- `qSupported` advertises `dosbox-x-linear-bp+` and `dosbox-x-eip-offset+`.
+- Register 8 reads back as an offset within CS, and `P` writes one register.
 - `savestate` completes in under a second while halted at a GDB breakpoint.
 - `memdump` refuses while the guest is running and agrees byte for byte with `m` while halted.
 - `dosbox_debug.py` still imports and still works for `powerbasic-decompile`, and raises on packed breakpoint addresses.
 - No file under `~/projects/lokkju/powerbasic-decompile` has been modified.
+- `.beads/` is untracked and ignored, and still present on disk.
