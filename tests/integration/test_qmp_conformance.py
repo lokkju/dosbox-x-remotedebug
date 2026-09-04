@@ -166,8 +166,15 @@ def test_system_reset_is_acknowledged(qmp):
 
 
 def test_debug_break_on_exec_toggles(qmp):
-    assert qmp.execute("debug-break-on-exec", {"enabled": True}) is not None
-    assert qmp.execute("debug-break-on-exec", {"enabled": False}) is not None
+    """The handler echoes {"enabled": <bool>}, so assert the echoed state
+    rather than merely that a reply arrived. `is not None` would pass even
+    if the server ignored the argument and never changed state at all.
+    """
+    enabled = qmp.execute("debug-break-on-exec", {"enabled": True})
+    assert enabled["enabled"] is True
+
+    disabled = qmp.execute("debug-break-on-exec", {"enabled": False})
+    assert disabled["enabled"] is False
 
 
 def test_an_unknown_command_is_an_error_not_a_hang(qmp):
