@@ -345,9 +345,17 @@ void QMPServer::handle_client() {
 }
 
 void QMPServer::send_greeting() {
-    // QMP greeting - tells client what capabilities are available
+    /* QMP greeting - tells the client what capabilities are available.
+     *
+     * The list is empty on purpose. It used to claim "oob", which in QMP
+     * means the server accepts out-of-band commands: ones carrying an "id"
+     * that it executes while another command is still in flight. This
+     * server processes commands strictly in order on one thread, and no
+     * handler reads or echoes "id", so a client that trusted the
+     * advertisement would wait for a reply that cannot arrive. Add "oob"
+     * back only alongside an out-of-band path and id echoing. */
     std::string greeting = "{\"QMP\": {\"version\": {\"qemu\": {\"micro\": 0, \"minor\": 0, \"major\": 0}, "
-                          "\"package\": \"DOSBox-X\"}, \"capabilities\": [\"oob\"]}}\r\n";
+                          "\"package\": \"DOSBox-X\"}, \"capabilities\": []}}\r\n";
     send_response(greeting);
 }
 

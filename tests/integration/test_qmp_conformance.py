@@ -282,5 +282,35 @@ def test_system_reset_refuses_while_halted_for_gdb(emulator):
     qmp.execute("system_reset")
 
 
+
+def test_greeting_does_not_advertise_oob(emulator):
+    """QMP `oob` means the server accepts out-of-band commands -- ones
+    carrying an "id" and executable while another command is in flight.
+    This server processes commands strictly in order on one thread and no
+    handler reads or echoes "id", so a client that trusts the advertisement
+    waits for a reply that cannot arrive."""
+    client = RawQMP(port=emulator.qmp_port, timeout=10.0)
+    greeting = client.connect()
+    try:
+        capabilities = greeting["QMP"]["capabilities"]
+        assert "oob" not in capabilities, (
+            f"greeting advertises oob with no out-of-band path: "
+            f"{capabilities!r}")
+    finally:
+        client.close()
+
+
+def test_greeting_is_still_a_well_formed_qmp_banner(emulator):
+    """Dropping oob must not break the shape QEMU clients parse."""
+    client = RawQMP(port=emulator.qmp_port, timeout=10.0)
+    greeting = client.connect()
+    try:
+        assert "QMP" in greeting
+        assert greeting["QMP"]["version"]["package"] == "DOSBox-X"
+        assert isinstance(greeting["QMP"]["capabilities"], list)
+    finally:
+        client.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

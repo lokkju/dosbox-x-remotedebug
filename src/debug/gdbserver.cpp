@@ -40,6 +40,12 @@ void GDBServer::stop() {
         server_fd = -1;
     }
     recv_buffer.clear();
+    /* A new connection is a new session. RSP has no way to resume one,
+     * so QStartNoAckMode must be renegotiated after a reconnect; this
+     * reset is deliberate, not an oversight. Recorded because the
+     * failure mode is silent -- a client that assumes acks stayed off
+     * desyncs the framing instead of getting an error.
+     * The other reset sites are try_accept() and poll(). */
     noack_mode = false;
 }
 
@@ -118,6 +124,8 @@ bool GDBServer::try_accept() {
 
     client_fd = new_fd;
     recv_buffer.clear();
+    /* A new connection is a new session: the client renegotiates
+     * QStartNoAckMode. See the note in stop(). */
     noack_mode = false;
 
     LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Client connected");
@@ -143,6 +151,7 @@ GDBAction GDBServer::poll() {
         close(client_fd);
         client_fd = -1;
         recv_buffer.clear();
+        /* Session over; the next client starts in ACK mode. See stop(). */
         noack_mode = false;
         return GDBAction::DISCONNECT;
     }

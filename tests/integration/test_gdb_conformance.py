@@ -14,6 +14,7 @@ Register 8 is EIP, an offset within CS. The linear PC is
 registers[10] * 16 + registers[8].
 """
 
+import socket
 import sys
 from pathlib import Path
 
@@ -458,6 +459,27 @@ def test_vcont_advertises_only_the_actions_it_dispatches(gdb):
     assert reply == "vCont;c;s", (
         f"vCont? advertises an action it does not dispatch: {reply!r}")
 
+
+def test_no_ack_mode_does_not_survive_a_reconnect(emulator):
+    """A new connection is a new session -- RSP has no way to resume one, so
+    the stub resets noack_mode on accept and on teardown. Pinned because the
+    failure mode is silent: a client that assumes acks stayed off desyncs
+    the framing rather than getting an error."""
+    first = RawGDB(port=emulator.gdb_port, timeout=10.0)
+    first.connect()
+    assert first.start_no_ack() is True
+    first.close()
+
+    sock = socket.create_connection(("127.0.0.1", emulator.gdb_port),
+                                    timeout=10.0)
+    try:
+        sock.settimeout(10.0)
+        sock.sendall(b"$?#3f")          # checksum of "?" is 0x3f
+        assert sock.recv(1) == b"+", (
+            "the stub did not ack on a fresh connection -- noack_mode "
+            "leaked across the reconnect")
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":
