@@ -363,7 +363,10 @@ GDBAction GDBServer::process_command(const std::string& cmd) {
 
 GDBAction GDBServer::handle_v_packets(const std::string& cmd) {
     if (cmd == "vCont?") {
-        send_packet("vCont;c;s;t");
+        /* Only the actions the switch below dispatches. `t` was advertised
+         * without a handler, so a client that took the advertisement at
+         * face value got the empty "unsupported" reply and stalled. */
+        send_packet("vCont;c;s");
         return GDBAction::NONE;
     }
 
@@ -556,7 +559,14 @@ void GDBServer::handle_query(const std::string& cmd) {
          *   yields a plausible-looking number.
          * Real gdb ignores features it does not recognise, so both stay
          * RSP-legal. */
-        send_packet("PacketSize=3fff;swbreak+;hwbreak+;vContSupported+;"
+        /* swbreak+ and hwbreak+ are deliberately NOT advertised. In
+         * qSupported they promise that stop replies carry a swbreak: or
+         * hwbreak: annotation saying why the stub stopped; this stub only
+         * ever sends a bare S05. hwbreak+ was doubly false because
+         * handle_breakpoint refuses Z1-Z4 outright. Advertising less is
+         * always safe; add either one back only together with the
+         * annotation it promises. */
+        send_packet("PacketSize=3fff;vContSupported+;"
                     "QStartNoAckMode+;dosbox-x-linear-bp+;"
                     "dosbox-x-eip-offset+");
     } else if (cmd.substr(0, 11) == "fThreadInfo") {

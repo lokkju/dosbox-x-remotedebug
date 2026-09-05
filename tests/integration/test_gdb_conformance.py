@@ -149,9 +149,11 @@ def test_qsupported_advertises_eip_as_an_offset(gdb):
 
 
 def test_qsupported_still_advertises_the_stock_features(gdb):
+    """swbreak+ and hwbreak+ used to be asserted here. They were dropped
+    from the handshake because neither is implemented -- see
+    test_qsupported_does_not_advertise_unimplemented_stop_annotations."""
     features = gdb.supported()
-    for feature in ("PacketSize=", "swbreak+", "hwbreak+",
-                    "vContSupported+", "QStartNoAckMode+"):
+    for feature in ("PacketSize=", "vContSupported+", "QStartNoAckMode+"):
         assert feature in features, f"lost {feature} from qSupported"
 
 
@@ -433,6 +435,28 @@ def test_write_registers_still_accepts_sixteen_registers(gdb):
     before = gdb.read_registers()
     payload = "".join(v.to_bytes(4, "little").hex() for v in before)
     assert gdb.send("G" + payload) == "OK"
+
+
+# -- the handshake must not advertise what the stub does not implement -----
+
+def test_qsupported_does_not_advertise_unimplemented_stop_annotations(gdb):
+    """swbreak+/hwbreak+ promise that stop replies carry a swbreak:/hwbreak:
+    annotation. The stub only ever sends a bare S05, and Z1-Z4 are refused
+    outright, so hwbreak+ is doubly false. Advertising less is always safe."""
+    reply = gdb.supported()
+    assert "swbreak" not in reply, (
+        f"qSupported advertises swbreak but no stop reply is annotated: "
+        f"{reply!r}")
+    assert "hwbreak" not in reply, (
+        f"qSupported advertises hwbreak but Z1-Z4 are refused: {reply!r}")
+
+
+def test_vcont_advertises_only_the_actions_it_dispatches(gdb):
+    """vCont? claimed `t`, but the dispatch switch handles only c and s, so
+    a client taking the advertisement at face value stalls."""
+    reply = gdb.send("vCont?")
+    assert reply == "vCont;c;s", (
+        f"vCont? advertises an action it does not dispatch: {reply!r}")
 
 
 
