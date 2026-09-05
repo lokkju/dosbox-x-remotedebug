@@ -103,7 +103,10 @@ bool GDBServer::try_accept() {
     // Check for mutual exclusion with interactive debugger
     if (DEBUG_IsInteractiveDebuggerActive()) {
         LOG(LOG_REMOTE, LOG_WARN)("GDBServer: Rejecting connection - interactive debugger is active");
-        const char* error_msg = "$E99#b2";
+        // Checksum is the low byte of the sum of the packet body: 'E'+'9'+'9'
+        // == 0xb7. This is the only hand-written packet in the file -- every
+        // other reply goes through send_packet(), which computes it.
+        const char* error_msg = "$E99#b7";
         send(new_fd, error_msg, strlen(error_msg), 0);
         close(new_fd);
         return false;

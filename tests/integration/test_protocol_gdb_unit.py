@@ -11,6 +11,7 @@ These never touch an emulator. Conformance tests that do live in
 test_gdb_conformance.py.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -94,3 +95,29 @@ def test_set_breakpoint_sends_a_linear_address():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --- Source-level guard on hand-written packets -------------------------
+
+# Every GDB reply should go through GDBServer::send_packet(), which computes
+# the checksum. One rejection path predates that and writes the packet out by
+# hand, where a wrong checksum is invisible until a conformance-checking
+# client rejects the reply. This scans for any such literal and verifies it,
+# so a future hand-written packet cannot reintroduce the bug.
+GDBSERVER_CPP = Path(__file__).resolve().parents[2] / "src" / "debug" / "gdbserver.cpp"
+
+PACKET_LITERAL = re.compile(r'"\$([^"#]*)#([0-9a-fA-F]{2})"')
+
+
+def test_hand_written_packet_literals_have_correct_checksums():
+    source = GDBSERVER_CPP.read_text(encoding="utf-8", errors="replace")
+    literals = PACKET_LITERAL.findall(source)
+    assert literals, f"no packet literals found in {GDBSERVER_CPP}; did the file move?"
+
+    wrong = []
+    for body, given in literals:
+        expected = sum(body.encode("ascii")) & 0xFF
+        if int(given, 16) != expected:
+            wrong.append(f"${body}#{given} should be #{expected:02x}")
+
+    assert not wrong, "hand-written packets with bad checksums: " + "; ".join(wrong)
