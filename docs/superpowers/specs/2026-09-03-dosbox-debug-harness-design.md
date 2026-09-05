@@ -314,7 +314,7 @@ signals.
 Moves: `free_port`, `port_is_listening`, `wait_ports_free`, `render_conf`,
 `wait_for_text`, `screen_lines`; the hand-rolled `memdump`, `read_screen`,
 `u16`, `read_word`, `read_block`, `registers_to_dict` helpers (they become
-client methods); `probe_concurrency.py` as `dbxdebug doctor`;
+client methods); the consumer's host-concurrency probe as `dbxdebug doctor`;
 `steps_out` / `walk_frames`, since 16-bit real-mode frame walking is generic
 x86 and not language-specific; and the batch fan-out *shell* — run N programs
 across M concurrent sessions, collect artifacts, respect host capacity.
