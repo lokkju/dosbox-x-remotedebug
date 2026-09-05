@@ -30,7 +30,10 @@ Bitu DEBUG_EnableDebugger(void);
 uint32_t DEBUG_GetRegister(int reg);
 void DEBUG_SetRegister(int reg, uint32_t value);
 uint8_t DEBUG_ReadMemory(uint32_t address);
-void DEBUG_WriteMemory(uint32_t address, uint8_t value);
+/* Returns true if the byte landed. A write to unmapped or
+ * write-protected memory fails; the GDB stub reports that as E01
+ * rather than telling the client guest state changed when it did not. */
+bool DEBUG_WriteMemory(uint32_t address, uint8_t value);
 void DEBUG_Step();
 void DEBUG_Continue();
 bool DEBUG_SetBreakpoint(uint32_t address);

@@ -464,11 +464,38 @@ void GDBServer::handle_write_memory(const std::string& args) {
         return;
     }
 
+    if (colon < comma) {
+        send_packet("E01");
+        return;
+    }
+
     uint32_t address = std::stoul(args.substr(0, comma), nullptr, 16);
-    std::string data = hex_decode(args.substr(colon + 1));
+    uint32_t length = std::stoul(args.substr(comma + 1, colon - comma - 1),
+                                 nullptr, 16);
+    const std::string payload = args.substr(colon + 1);
+
+    /* M carries the byte count twice: as `length`, and as the width of the
+     * payload. They must agree. `length` used to be parsed off the wire and
+     * never read, so a short payload wrote fewer bytes than the client asked
+     * for and a long one wrote past the region it asked for -- both with OK.
+     * Two hex digits per byte, so an odd-width payload is malformed too;
+     * hex_decode drops its trailing nibble. */
+    if (payload.length() != static_cast<size_t>(length) * 2) {
+        send_packet("E01");
+        return;
+    }
+
+    const std::string data = hex_decode(payload);
 
     for (size_t i = 0; i < data.length(); ++i) {
-        DEBUG_WriteMemory(address + static_cast<uint32_t>(i), data[i]);
+        if (!DEBUG_WriteMemory(address + static_cast<uint32_t>(i),
+                               static_cast<uint8_t>(data[i]))) {
+            /* Bytes before this one already landed. RSP has no way to say
+             * how far a partial write got, so report the failure and let the
+             * client re-read the region. */
+            send_packet("E01");
+            return;
+        }
     }
 
     send_packet("OK");

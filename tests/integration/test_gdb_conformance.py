@@ -346,5 +346,53 @@ def test_breakpoint_above_64k_still_works_after_the_pmode_guard(gdb):
     assert gdb.remove_breakpoint(REAL_MODE_GUARD_ADDR) is True
 
 
+# -- M must honour its declared length, and report a write that fails ------
+
+M_SCRATCH = 0x30300
+
+
+def test_write_memory_rejects_a_payload_shorter_than_the_declared_length(gdb):
+    """`M addr,length:XX...` carries the byte count twice. The stub used to
+    ignore `length` entirely and write however many bytes the payload
+    decoded to, so a truncated packet wrote a short block and still said OK
+    -- the client believes it changed guest state it did not change."""
+    gdb.halt()
+    reply = gdb.send(f"M{M_SCRATCH:x},4:0011")
+    assert reply == "E01", (
+        f"M with a 2-byte payload declaring 4 bytes should be rejected, "
+        f"got {reply!r}")
+
+
+def test_write_memory_rejects_a_payload_longer_than_the_declared_length(gdb):
+    """The over-long direction is the dangerous one: the extra bytes land in
+    guest memory past the region the client asked to write."""
+    gdb.halt()
+    reply = gdb.send(f"M{M_SCRATCH:x},2:00112233")
+    assert reply == "E01", (
+        f"M with a 4-byte payload declaring 2 bytes should be rejected, "
+        f"got {reply!r}")
+
+
+def test_write_memory_rejects_an_odd_length_payload(gdb):
+    """A payload that is not a whole number of hex byte pairs is malformed;
+    hex_decode silently drops the trailing nibble."""
+    gdb.halt()
+    reply = gdb.send(f"M{M_SCRATCH:x},2:00112")
+    assert reply == "E01", f"M with an odd-length payload got {reply!r}"
+
+
+def test_write_memory_still_accepts_an_agreeing_length(gdb):
+    """The guard must not reject well-formed packets."""
+    gdb.halt()
+    assert gdb.write_memory(M_SCRATCH, b"\xde\xad\xbe\xef") is True
+    assert gdb.read_memory(M_SCRATCH, 4) == b"\xde\xad\xbe\xef"
+
+
+def test_write_memory_of_zero_length_is_accepted(gdb):
+    gdb.halt()
+    assert gdb.send(f"M{M_SCRATCH:x},0:") == "OK"
+
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

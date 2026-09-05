@@ -6186,8 +6186,11 @@ uint32_t DEBUG_GetRegister(int reg) {
      return value;
  }
 
- void DEBUG_WriteMemory(uint32_t address, uint8_t value) {
-     mem_writeb_checked(address, value);
+ bool DEBUG_WriteMemory(uint32_t address, uint8_t value) {
+     /* mem_writeb_checked returns TRUE on failure. Discarding it reported
+      * success for writes that never landed, which is worse than the read
+      * case: the client believes it changed guest state. */
+     return !mem_writeb_checked(address, value);
  }
 
  void DEBUG_Step() {
