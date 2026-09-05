@@ -3,6 +3,7 @@
 #if C_REMOTEDEBUG
 
 #include <errno.h>
+#include <netinet/tcp.h>
 #include <stdexcept>
 #include "gdbserver.h"
 #include "debug.h"
@@ -117,6 +118,15 @@ bool GDBServer::try_accept() {
         close(new_fd);
         return false;
     }
+
+    /* The RSP is strictly request/response with tiny packets, which is the
+     * workload Nagle punishes worst: each side holds a small write waiting for
+     * an ACK the peer has delayed, costing ~40ms per direction. Measured
+     * ~82ms per round-trip with it on, ~41ms with only the client fixed, so
+     * both ends have to set it. Cost is per round-trip regardless of size, so
+     * it falls entirely on trip count. */
+    int nodelay = 1;
+    setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
     // Set client socket non-blocking
     int flags = fcntl(new_fd, F_GETFL, 0);
