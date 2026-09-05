@@ -113,6 +113,10 @@ def test_query_commands_lists_every_dispatched_command(qmp):
         "qmp_capabilities", "send-key", "input-send-event", "query-commands",
         "memdump", "screendump", "savestate", "loadstate", "stop", "cont",
         "system_reset", "query-status", "debug-break-on-exec",
+        # Acknowledged no-ops kept for QEMU-client compatibility. They are
+        # dispatched, so they belong in the list; a client that sees them
+        # absent concludes the server rejects them.
+        "quit", "system_powerdown",
     }
     missing = expected - listed
     assert not missing, f"query-commands omits {sorted(missing)}"

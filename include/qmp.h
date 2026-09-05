@@ -100,8 +100,20 @@ private:
     std::string receive_command();
     void process_command(const std::string& cmd);
 
+    /* One table drives both the dispatch in process_command and the list
+     * query-commands advertises, so the implemented set and the advertised
+     * set cannot drift apart. They did: the advertised list was a second
+     * hand-written copy and fell behind the dispatch. Every entry is
+     * advertised -- if it is dispatched, a client is entitled to find it. */
+    struct CommandTableEntry {
+        const char* name;
+        void (*invoke)(QMPServer& self, const std::string& cmd);
+    };
+    static const std::vector<CommandTableEntry>& command_table();
+
     // Command handlers
     void handle_qmp_capabilities();
+    void handle_acknowledged_no_op();
     void handle_send_key(const std::string& cmd);
     void handle_input_send_event(const std::string& cmd);
     void handle_query_commands();

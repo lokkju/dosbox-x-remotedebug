@@ -398,43 +398,60 @@ std::string QMPServer::receive_command() {
     return "";
 }
 
-void QMPServer::process_command(const std::string& cmd) {
-    std::string execute = extract_string(cmd, "execute");
+const std::vector<QMPServer::CommandTableEntry>& QMPServer::command_table() {
+    /* Defined inside a member function so the lambdas inherit the class's
+     * access to the private handlers. Captureless lambdas convert to the
+     * plain function pointer the entry holds. */
+    static const std::vector<CommandTableEntry> table = {
+        {"qmp_capabilities",
+         [](QMPServer& s, const std::string&) { s.handle_qmp_capabilities(); }},
+        {"send-key",
+         [](QMPServer& s, const std::string& c) { s.handle_send_key(c); }},
+        {"input-send-event",
+         [](QMPServer& s, const std::string& c) { s.handle_input_send_event(c); }},
+        {"query-commands",
+         [](QMPServer& s, const std::string&) { s.handle_query_commands(); }},
+        {"query-status",
+         [](QMPServer& s, const std::string&) { s.handle_query_status(); }},
+        {"memdump",
+         [](QMPServer& s, const std::string& c) { s.handle_memdump(c); }},
+        {"screendump",
+         [](QMPServer& s, const std::string& c) { s.handle_screendump(c); }},
+        {"savestate",
+         [](QMPServer& s, const std::string& c) { s.handle_savestate(c); }},
+        {"loadstate",
+         [](QMPServer& s, const std::string& c) { s.handle_loadstate(c); }},
+        {"stop",
+         [](QMPServer& s, const std::string&) { s.handle_stop(); }},
+        {"cont",
+         [](QMPServer& s, const std::string&) { s.handle_cont(); }},
+        {"system_reset",
+         [](QMPServer& s, const std::string& c) { s.handle_system_reset(c); }},
+        {"debug-break-on-exec",
+         [](QMPServer& s, const std::string& c) { s.handle_debug_break_on_exec(c); }},
+        {"quit",
+         [](QMPServer& s, const std::string&) { s.handle_acknowledged_no_op(); }},
+        {"system_powerdown",
+         [](QMPServer& s, const std::string&) { s.handle_acknowledged_no_op(); }},
+    };
+    return table;
+}
 
-    if (execute == "qmp_capabilities") {
-        handle_qmp_capabilities();
-    } else if (execute == "send-key") {
-        handle_send_key(cmd);
-    } else if (execute == "input-send-event") {
-        handle_input_send_event(cmd);
-    } else if (execute == "query-commands") {
-        handle_query_commands();
-    } else if (execute == "memdump") {
-        handle_memdump(cmd);
-    } else if (execute == "screendump") {
-        handle_screendump(cmd);
-    } else if (execute == "savestate") {
-        handle_savestate(cmd);
-    } else if (execute == "loadstate") {
-        handle_loadstate(cmd);
-    } else if (execute == "stop") {
-        handle_stop();
-    } else if (execute == "cont") {
-        handle_cont();
-    } else if (execute == "system_reset") {
-        handle_system_reset(cmd);
-    } else if (execute == "query-status") {
-        handle_query_status();
-    } else if (execute == "debug-break-on-exec") {
-        handle_debug_break_on_exec(cmd);
-    } else if (execute == "quit" || execute == "system_powerdown") {
-        send_success();
-        // Don't actually quit DOSBox, just acknowledge
-    } else if (!execute.empty()) {
-        send_error("CommandNotFound", "Command not found: " + execute);
-    } else {
+void QMPServer::process_command(const std::string& cmd) {
+    const std::string execute = extract_string(cmd, "execute");
+    if (execute.empty()) {
         send_error("GenericError", "Invalid command format");
+        return;
     }
+
+    for (const CommandTableEntry& entry : command_table()) {
+        if (execute == entry.name) {
+            entry.invoke(*this, cmd);
+            return;
+        }
+    }
+
+    send_error("CommandNotFound", "Command not found: " + execute);
 }
 
 void QMPServer::handle_qmp_capabilities() {
@@ -442,22 +459,27 @@ void QMPServer::handle_qmp_capabilities() {
     send_success();
 }
 
+void QMPServer::handle_acknowledged_no_op() {
+    /* quit and system_powerdown are acknowledged but not acted on: a debug
+     * client must not be able to take the emulator down out from under the
+     * user. They are dispatched, so they are advertised -- a client that
+     * does not find them in query-commands concludes they would be
+     * rejected, which is a different lie from the one they tell now. */
+    send_success();
+}
+
 void QMPServer::handle_query_commands() {
-    std::string response = "{\"return\": ["
-        "{\"name\": \"qmp_capabilities\"},"
-        "{\"name\": \"send-key\"},"
-        "{\"name\": \"input-send-event\"},"
-        "{\"name\": \"query-commands\"},"
-        "{\"name\": \"query-status\"},"
-        "{\"name\": \"memdump\"},"
-        "{\"name\": \"screendump\"},"
-        "{\"name\": \"savestate\"},"
-        "{\"name\": \"loadstate\"},"
-        "{\"name\": \"stop\"},"
-        "{\"name\": \"cont\"},"
-        "{\"name\": \"system_reset\"},"
-        "{\"name\": \"debug-break-on-exec\"}"
-    "]}\r\n";
+    /* Built from the dispatch table, never from a second list of names. */
+    std::string response = "{\"return\": [";
+    bool first = true;
+    for (const CommandTableEntry& entry : command_table()) {
+        if (!first) response += ",";
+        first = false;
+        response += "{\"name\": \"";
+        response += entry.name;
+        response += "\"}";
+    }
+    response += "]}\r\n";
     send_response(response);
 }
 

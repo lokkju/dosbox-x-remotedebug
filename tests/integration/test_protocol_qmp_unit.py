@@ -8,6 +8,7 @@
 """Offline unit tests for the raw QMP client framing."""
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -105,6 +106,51 @@ def test_an_unresponsive_server_raises_a_protocol_error_not_a_socket_error():
     client._sock = TimingOutSocket()
     with pytest.raises(QMPProtocolError, match="timed out"):
         client.execute("query-status")
+
+
+
+# --- Source-level guard on the QMP command table -------------------------
+
+# query-commands used to be a second, hand-written copy of the command set,
+# and it drifted from the dispatch. Both now read one table, so the only way
+# to reintroduce the drift is to add a dispatch branch that bypasses it.
+# This scans for that shape.
+QMP_CPP = Path(__file__).resolve().parents[2] / "src" / "debug" / "qmp.cpp"
+
+EXECUTE_COMPARE = re.compile(r'execute\s*==\s*"([^"]+)"')
+
+
+def test_no_command_is_dispatched_outside_the_command_table():
+    source = QMP_CPP.read_text(encoding="utf-8", errors="replace")
+    stray = EXECUTE_COMPARE.findall(source)
+    assert not stray, (
+        "these commands are dispatched by a direct string comparison instead "
+        "of the command table, so query-commands cannot see them: "
+        + ", ".join(sorted(set(stray))))
+
+
+COMMAND_TABLE_ENTRY = re.compile(r'\{"([A-Za-z0-9_\-]+)",\s*\[\]')
+
+
+def test_the_command_table_is_the_source_of_the_advertised_list():
+    """handle_query_commands must build its reply by walking the table. A
+    second, hand-written list of names is exactly what drifted before."""
+    source = QMP_CPP.read_text(encoding="utf-8", errors="replace")
+    names = COMMAND_TABLE_ENTRY.findall(source)
+    assert len(names) >= 10, (
+        f"found only {names} in the command table; did it move or change "
+        f"shape? update this guard")
+
+    start = source.find("void QMPServer::handle_query_commands()")
+    assert start != -1, "handle_query_commands moved; update this guard"
+    body = source[start:source.find("\n}", start)]
+
+    assert "command_table()" in body, (
+        "handle_query_commands does not walk the command table")
+    duplicated = [n for n in names if f'"{n}"' in body]
+    assert not duplicated, (
+        "handle_query_commands hard-codes command names that also live in "
+        "the table, so the two can drift again: " + ", ".join(duplicated))
 
 
 if __name__ == "__main__":
