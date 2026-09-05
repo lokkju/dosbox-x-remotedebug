@@ -386,6 +386,13 @@ GDBAction GDBServer::handle_v_packets(const std::string& cmd) {
 
 void GDBServer::handle_read_register(const std::string& cmd) {
     int reg_num = std::stoi(cmd.substr(1), nullptr, 16);
+    /* DEBUG_GetRegister's `default: return 0` makes an out-of-range index
+     * answer 00000000, which a client cannot tell from a register that
+     * genuinely holds zero. P has always validated 0..15; p and G did not. */
+    if (reg_num < 0 || reg_num > 15) {
+        send_packet("E01");
+        return;
+    }
     uint32_t value = DEBUG_GetRegister(reg_num);
 
     std::stringstream ss;
@@ -408,6 +415,16 @@ void GDBServer::handle_read_registers() {
 }
 
 void GDBServer::handle_write_registers(const std::string& args) {
+    /* Sixteen registers of eight hex digits each, and nothing else. The
+     * loop used to run over whatever the client sent: a ragged tail was
+     * dropped, and indices past 15 fell through DEBUG_SetRegister's switch
+     * and were discarded -- with OK either way. */
+    const size_t reg_count = 16;
+    if (args.length() % 8 != 0 || args.length() / 8 > reg_count) {
+        send_packet("E01");
+        return;
+    }
+
     // Parse hex string, 8 chars per register
     for (size_t i = 0; i < args.length() / 8; ++i) {
         std::string hex_val = args.substr(i * 8, 8);

@@ -393,6 +393,48 @@ def test_write_memory_of_zero_length_is_accepted(gdb):
     assert gdb.send(f"M{M_SCRATCH:x},0:") == "OK"
 
 
+# -- p and G must bound-check register indices the way P already does ------
+
+def test_read_register_rejects_an_out_of_range_index(gdb):
+    """DEBUG_GetRegister's `default: return 0` makes p10 (index 16, one past
+    GS) answer 00000000, which a client cannot tell from a register that
+    genuinely holds zero. The spec wants E NN for an unknown register."""
+    gdb.halt()
+    reply = gdb.send("p10")
+    assert reply == "E01", (
+        f"p with index 16 should be rejected, got {reply!r}")
+
+
+def test_read_register_still_accepts_a_valid_index(gdb):
+    gdb.halt()
+    assert gdb.write_register(3, 0x1234) is True
+    assert gdb.send("p3") == "34120000"
+
+
+def test_write_registers_rejects_a_payload_with_too_many_registers(gdb):
+    """G looped over whatever the client sent; indices past 15 fell through
+    DEBUG_SetRegister's switch and were dropped, and the client got OK."""
+    gdb.halt()
+    reply = gdb.send("G" + "00000000" * 17)
+    assert reply == "E01", (
+        f"G with 17 registers should be rejected, got {reply!r}")
+
+
+def test_write_registers_rejects_a_ragged_payload(gdb):
+    """A G payload that is not a whole number of 8-hex-digit registers is
+    malformed; the trailing partial word was silently discarded."""
+    gdb.halt()
+    reply = gdb.send("G" + "00000000" * 2 + "0011")
+    assert reply == "E01", f"G with a ragged payload got {reply!r}"
+
+
+def test_write_registers_still_accepts_sixteen_registers(gdb):
+    gdb.halt()
+    before = gdb.read_registers()
+    payload = "".join(v.to_bytes(4, "little").hex() for v in before)
+    assert gdb.send("G" + payload) == "OK"
+
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
