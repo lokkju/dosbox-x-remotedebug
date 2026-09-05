@@ -148,3 +148,7 @@ contrib/macos/dosbox-x.plist
 # Python bytecode caches (e.g. tests/integration/)
 __pycache__/
 *.pyc
+
+# Internal planning documents: local working notes, not part of the source
+# tree. Specs under docs/superpowers/specs/ remain tracked.
+docs/superpowers/plans/
