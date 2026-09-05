@@ -2,7 +2,9 @@
 
 Date: 2026-09-03
 Status: approved, ready for implementation planning
-Repos in scope: `dosbox-x` (this repo), `dbxdebug`, `powerbasic-decompile`
+Repos in scope: `dosbox-x` (this repo), `dbxdebug`, and one downstream
+consumer of these clients — referred to throughout as "the consumer
+project" — which drives DOSBox-X for its own domain analysis.
 
 ## 1. Why
 
@@ -11,9 +13,9 @@ forked twice and has a silent correctness bug. This design fixes the bug at
 its source, splits the harness into two layers with a defensible boundary,
 and ships the operating knowledge as skills so it stops being rediscovered.
 
-Evidence comes from reviewing the DOSBox-X usage in
-`powerbasic-decompile`'s Claude session logs: one 21k-line session plus 210
-subagent transcripts, 1,757 DOSBox-related tool calls. Every claim below was
+Evidence comes from reviewing the DOSBox-X usage in the consumer project's
+Claude session logs: one 21k-line session plus 210 subagent transcripts,
+1,757 DOSBox-related tool calls. Every claim below was
 re-verified against this repo's source at HEAD.
 
 ### 1.1 What the review found
@@ -75,8 +77,8 @@ emulation thread and poll for a result. `memdump` calls
 
 **F8 — Three implementations, no shared home.** `dosbox_debug.py` (931 lines,
 protocol plus a weak launcher); `dbxdebug` (3,013 lines, protocol and CLI, no
-launcher); `powerbasic-decompile/tools/dosbox/session.py` (46 KB, launcher
-only, importing this repo's clients). 38 files there run on `DosboxSession`;
+launcher); the consumer project's session launcher (46 KB, launcher only,
+importing this repo's clients). 38 files there run on `DosboxSession`;
 8 still hardcode ports.
 
 ## 2. The seam
@@ -87,7 +89,7 @@ Three layers, dependencies pointing one way:
 | --- | --- | --- | --- |
 | Servers + conformance suite | `dosbox-x` | GPLv2 | stdlib, pytest |
 | Library | `dbxdebug` | Polyform Shield 1.0.0 | stdlib, `click`, `loguru` |
-| Domain | `powerbasic-decompile` | — | `dbxdebug` |
+| Domain | the consumer project | — | `dbxdebug` |
 
 **The in-repo Python layer must stay dependency-free.** `dbxdebug` is
 Polyform Shield, which is neither OSI nor GPL-compatible; a GPLv2 project
@@ -197,11 +199,11 @@ defensible, and stops it duplicating `dbxdebug`.
 
 ### 3.4 `dosbox_debug.py` survives Stage 1
 
-`dosbox_debug.py` is **not** deleted in Stage 1. `powerbasic-decompile`'s
-`session.py` imports `GDBClient` / `QMPClient` from it by path
+`dosbox_debug.py` is **not** deleted in Stage 1. The consumer project's
+session launcher imports `GDBClient` / `QMPClient` from it by path
 (`_import_clients()`), so deleting it before `dbxdebug` ships the replacement
-breaks pb for the whole gap. It is deleted at the end of Stage 2, once
-`dbxdebug` is released and pb has somewhere to go.
+breaks that consumer for the whole gap. It is deleted at the end of Stage 2,
+once `dbxdebug` is released and the consumer has somewhere to go.
 
 Two changes it does get in Stage 1:
 
@@ -212,12 +214,12 @@ Two changes it does get in Stage 1:
   past 1 MB including the HMA, so nothing legitimate lands there, whereas a
   packed `0x0824:5A90` arrives as `0x08245A90`.
 
-The guard exists for pb specifically. Its `bp_addr` packs `(seg << 16) | off`,
-which is correct against today's stub and *wrong* the moment Stage 1 lands —
-and pb reaches the stub through this client, which has no `qSupported`
-handshake. Without the guard pb's breakpoints would go quietly dead on the
-next rebuild, which is the exact failure mode this whole design exists to
-remove.
+The guard exists for the consumer project specifically. Its `bp_addr` packs
+`(seg << 16) | off`, which is correct against today's stub and *wrong* the
+moment Stage 1 lands — and the consumer reaches the stub through this client,
+which has no `qSupported` handshake. Without the guard its breakpoints would
+go quietly dead on the next rebuild, which is the exact failure mode this
+whole design exists to remove.
 
 Note the inverse, which needs no action: `dosbox_debug.py`'s own
 `(seg << 4) + off` conversion *is* the linear address, so its breakpoints
@@ -261,16 +263,16 @@ them is a regression this stage introduced.
 src/dbxdebug/
   gdb.py         protocol client + capability handshake at connect
   qmp.py         protocol client + the six unwrapped commands
-  session.py     DosboxSession                       <- from pb, near-verbatim
+  session.py     DosboxSession                <- from the consumer, verbatim
   registry.py    registry, list/reap, killpg         <- split out of session.py
   addressing.py  linear / "seg:off" conversion + trap history
   video.py       screen reading (existing)
   cli.py         + `dbxdebug session --list/--reap`, `dbxdebug doctor`
 ```
 
-Splitting `registry.py` out is the one structural change to pb's file: at
-46 KB it does lifecycle *and* cross-process bookkeeping, and `--reap` is
-useful with no session object in hand.
+Splitting `registry.py` out is the one structural change to the consumer's
+file: at 46 KB it does lifecycle *and* cross-process bookkeeping, and
+`--reap` is useful with no session object in hand.
 
 ### 4.2 Behavior carried over from `session.py`
 
@@ -293,38 +295,40 @@ signals.
   (linear) or a `"seg:off"` string, and `"seg:off"` is `seg*16+off`
   everywhere.
 - **`bp_addr` becomes a raising shim, exported from `dbxdebug.addressing`.**
-  pb's `bp_addr(seg, off)` packs
-  `(seg << 16) | off` and its guardrail — separate arguments, no single-number
-  overload — exists because pre-added values were silently wrong. After the
-  fix, pre-added is correct and the packed form is wrong. `dbxdebug` exports
-  the name so that a pb call site missed in Stage 3 raises on import-and-call
-  with a pointer to the migration note, rather than silently packing an
-  address that no longer means anything. It must never keep encoding quietly.
+  The consumer's `bp_addr(seg, off)` packs `(seg << 16) | off` and its
+  guardrail — separate arguments, no single-number overload — exists because
+  pre-added values were silently wrong. After the fix, pre-added is correct
+  and the packed form is wrong. `dbxdebug` exports the name so that a
+  consumer call site missed in Stage 3 raises on import-and-call with a
+  pointer to the migration note, rather than silently packing an address that
+  no longer means anything. It must never keep encoding quietly.
 - **`connect()` refuses a pre-fix stub.** `GDBClient.connect()` reads
   `qSupported`; without `dosbox-x-linear-bp+` it raises unless the caller
-  passes an explicit override. This is what stops pb's 38 call sites from
-  silently mis-breaking against a stale build.
+  passes an explicit override. This is what stops the consumer's 38 call
+  sites from silently mis-breaking against a stale build.
 - **The unwrapped QMP commands land:** `memdump`, `screendump`, `savestate`,
   `loadstate`, `system_reset`, `quit`.
 
-### 4.4 What else moves from pb
+### 4.4 What else moves from the consumer project
 
 Moves: `free_port`, `port_is_listening`, `wait_ports_free`, `render_conf`,
 `wait_for_text`, `screen_lines`; the hand-rolled `memdump`, `read_screen`,
 `u16`, `read_word`, `read_block`, `registers_to_dict` helpers (they become
 client methods); `probe_concurrency.py` as `dbxdebug doctor`;
 `steps_out` / `walk_frames`, since 16-bit real-mode frame walking is generic
-x86 and not PowerBASIC; and the batch fan-out *shell* — run N programs across
-M concurrent sessions, collect artifacts, respect host capacity.
+x86 and not language-specific; and the batch fan-out *shell* — run N programs
+across M concurrent sessions, collect artifacts, respect host capacity.
 
-Stays in pb: `capture_stage.py` (PBMAIN versus MZ entry is PowerBASIC
-startup semantics), `find_data_segment`, `pb_encode` / `pb_decode`,
-`decode_glyph`, `rnd_value`, the `capture_hhfe_*` and `trace_*` scripts,
-corpus-write policy, and `assert_meaningful` / `VacuousComparison` — that is
-measurement discipline coupled to how pb builds paired corpora. The narrow
-emulator-specific piece does move: a `session.assert_screen_readable()` that
-rejects an all-blank or still-at-the-banner capture, because that failure
-belongs to DOSBox and not to pb.
+Stays in the consumer project: its language-specific capture and trace
+scripts — entry-point detection for the source language's startup semantics
+as distinct from the MZ entry, data-segment location, its own encode/decode
+helpers, glyph decoding, RNG reproduction — together with corpus-write policy
+and its vacuous-comparison guards. None of that is emulator mechanics: it is
+domain logic, plus measurement discipline coupled to how that project builds
+paired corpora. The narrow emulator-specific piece does move: a
+`session.assert_screen_readable()` that rejects an all-blank or
+still-at-the-banner capture, because that failure belongs to DOSBox and not
+to the consumer.
 
 ### 4.5 Tests
 
@@ -333,20 +337,20 @@ belongs to DOSBox and not to pb.
 binary. The conformance assertions live upstream, not here; `dbxdebug` tests
 its own behavior against a conforming stub.
 
-## 5. Stage 3 — `powerbasic-decompile` migration
+## 5. Stage 3 — consumer migration
 
 **Constraint: that working tree is edited by other agents concurrently.
 Nothing there is modified without explicit confirmation from the user first.**
 The migration is prepared as a described diff and applied as one reviewable
 sweep, timed by the user.
 
-`tools/dosbox/__init__.py` already re-exports the whole public surface, so the
-migration is:
+The consumer's package `__init__` already re-exports the whole public
+surface, so the migration is:
 
-1. Rewrite `tools/dosbox/__init__.py` as a re-export of `dbxdebug`. The 38
-   call sites keep working untouched.
+1. Rewrite that `__init__` as a re-export of `dbxdebug`. The 38 call sites
+   keep working untouched.
 2. Rewrite call sites to import `dbxdebug` directly.
-3. Delete `tools/dosbox/session.py` and the shim. `dosbox_debug.py` is
+3. Delete the consumer's session launcher and the shim. `dosbox_debug.py` is
    deleted upstream once this step is reached (see 3.4).
 4. Convert the 8 files still hardcoding 2159/4444 in the same sweep, so no
    second class of caller survives.
@@ -407,12 +411,13 @@ not re-derived from source a third time.
 ## 7. Sequencing
 
 Correctness first, in four stages: Stage 1 (`dosbox-x`, and the PR), Stage 2
-(`dbxdebug`), Stage 3 (pb migration, on the user's timing), Stage 4 (skills).
+(`dbxdebug`), Stage 3 (consumer migration, on the user's timing), Stage 4
+(skills).
 
 Stage 1 first because F1 is the only defect here that produces confidently
 wrong results rather than visible failures. The `qSupported` handshake means
-fixing it first does not strand pb: the breakage becomes loud instead of
-silent.
+fixing it first does not strand the consumer: the breakage becomes loud
+instead of silent.
 
 Stage 4 lands last but its `references/` are written throughout — the trap
 list and the history are byproducts of Stages 1 to 3, not a separate research
@@ -424,8 +429,9 @@ effort.
   `gdbserver.cpp`. The change is a reordering of existing calls, and the
   conformance suite pins the behavior, but it is the part of the PR most
   likely to draw review.
-- **The pb migration runs against a concurrently-edited tree.** Mitigated by
-  preparing it as one reviewable sweep and applying it only on confirmation.
+- **The consumer migration runs against a concurrently-edited tree.**
+  Mitigated by preparing it as one reviewable sweep and applying it only on
+  confirmation.
 - **`AddBreakpoint(0, linear)` is verified for real mode.** `GetAddress`
   branches on `cpu.pmode` (`debug.cpp:450`); protected-mode breakpoint
   addressing is out of scope here and the conformance suite asserts real mode

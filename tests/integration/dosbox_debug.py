@@ -6,8 +6,9 @@ external dependencies, avoiding issues with third-party libraries.
 
 DEPRECATED. This module is superseded by `dbxdebug`, which carries the same
 protocol clients plus session lifecycle, and is maintained on its own release
-cycle. It survives only until dbxdebug ships a replacement, because
-powerbasic-decompile imports GDBClient and QMPClient from it by path.
+cycle. It survives only until dbxdebug ships a replacement, because a
+downstream consumer imports GDBClient and QMPClient from it by path and has
+nowhere else to get them until then.
 
 New code in this repository should use tests/integration/protocol/ instead.
 See docs/superpowers/specs/2026-09-03-dosbox-debug-harness-design.md.
