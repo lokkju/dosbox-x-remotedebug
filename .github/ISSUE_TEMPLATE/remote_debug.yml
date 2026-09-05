@@ -1,0 +1,49 @@
+name: Remote-debug subsystem issue
+description: A defect in the GDB stub, the QMP server, or their hooks in the debugger
+labels: ["remote-debug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        **This tracker covers only the remote-debug subsystem** --
+        `src/debug/gdbserver.cpp`, `src/debug/qmp.cpp`, and the parts of
+        `src/debug/debug.cpp` and `src/dosbox.cpp` that serve them.
+        Anything else belongs upstream at joncampbell123/dosbox-x.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      options:
+        - GDB stub (gdbserver.cpp)
+        - QMP server (qmp.cpp)
+        - Debugger hooks (debug.cpp)
+        - Servicing / halt-resume (dosbox.cpp)
+        - Conformance suite (tests/integration)
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens, and what should happen instead
+      description: >-
+        For a protocol defect, give the exact packet or JSON sent and received.
+        Byte-level detail is more useful here than a description.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        The smallest sequence that shows it. If a conformance test reproduces
+        it, name the test.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or branch
+      description: Output of `git rev-parse --short HEAD`, and the branch.
+    validations:
+      required: true

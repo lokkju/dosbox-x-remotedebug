@@ -1,3 +1,23 @@
+> ### This is a fork, not DOSBox-X itself
+>
+> It exists to carry the **GDB/QMP remote-debug subsystem** —
+> `src/debug/gdbserver.cpp`, `src/debug/qmp.cpp`, and their hooks in
+> `src/debug/debug.cpp` and `src/dosbox.cpp` — plus a conformance suite for
+> them under `tests/integration/`.
+>
+> **Do not report general DOSBox-X issues here.** Emulation, video, audio,
+> DOS/BIOS, the GUI and builds are all upstream's:
+> [joncampbell123/dosbox-x](https://github.com/joncampbell123/dosbox-x/issues).
+> This tracker is scoped to the remote-debug subsystem and is not watched for
+> anything else.
+>
+> The Python client for these servers lives in a separate project,
+> [dbxdebug](https://github.com/lokkju/dbxdebug); bugs in the client, the
+> session lifecycle or its CLI belong there rather than here.
+>
+> Everything below this line is upstream's README, unchanged.
+
+---
 
 **Welcome to the DOSBox-X project homepage located on GitHub.**
 
