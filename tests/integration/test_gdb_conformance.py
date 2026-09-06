@@ -610,12 +610,15 @@ def test_memory_read_stops_at_the_top_of_the_address_space(gdb):
         f"the tail of the reply is the bottom of memory: {reply!r}")
 
 
-def test_memory_write_stops_at_the_top_of_the_address_space(gdb):
-    """The same uint32_t addition in M would scribble over address 0 while
-    reporting OK for a write at the top of memory."""
+def test_memory_write_is_refused_at_the_top_of_the_address_space(gdb):
+    """The same uint32_t addition in M would run past 0xFFFFFFFF, continue
+    at address 0 and scribble over the interrupt vector table, all while
+    answering OK. M cannot report how far a partial write got, so the whole
+    request is refused before any of it lands."""
     gdb.halt()
     before = gdb.send("m0,8")
-    gdb.send("Mfffffffe,8:0102030405060708")
+    assert gdb.send("Mfffffffe,8:0102030405060708") == "E01", (
+        "a write running off the top of the address space should be refused")
     assert gdb.send("m0,8") == before, (
         "a write at 0xFFFFFFFE modified memory at address 0 -- it wrapped")
 

@@ -554,10 +554,18 @@ void GDBServer::handle_read_memory(const std::string& args) {
      * Reporting E01 only when nothing at all could be read keeps every
      * client that reads mapped memory working exactly as before, while no
      * longer passing a fabricated 0 off as guest state. */
+    /* `address + read` is uint32_t arithmetic, so a read starting near
+     * 0xFFFFFFFF used to wrap and carry on from address 0, splicing the
+     * bottom of memory onto the top and presenting it as one contiguous
+     * region. Stop at the wrap instead and return the bytes actually read:
+     * the short reply is the same thing the loop already emits when it hits
+     * unreadable memory, and it says truthfully that the region ends here. */
     uint32_t read = 0;
     for (; read < length; ++read) {
+        const uint32_t addr = address + read;
+        if (read != 0 && addr < address) break;  // wrapped past 0xFFFFFFFF
         uint8_t value;
-        if (!DEBUG_ReadMemory(address + read, &value)) break;
+        if (!DEBUG_ReadMemory(addr, &value)) break;
         ss << std::setw(2) << static_cast<int>(value);
     }
 
@@ -600,9 +608,24 @@ void GDBServer::handle_write_memory(const std::string& args) {
 
     const std::string data = hex_decode(payload);
 
+    /* Same uint32_t wrap as the read path, and worse here: a write running
+     * past 0xFFFFFFFF used to continue at address 0 and scribble over the
+     * interrupt vector table, all while answering OK. A short write is not
+     * an option -- M has no way to say how far it got -- and the region the
+     * client named does not exist, so refuse the whole request before
+     * touching any memory rather than performing the part that does fit. */
+    if (!data.empty()
+        && data.length() - 1 > static_cast<size_t>(0xFFFFFFFFu - address)) {
+        LOG(LOG_REMOTE, LOG_WARN)("GDBServer: M rejected: %u bytes at 0x%08x "
+                                  "runs past the top of the address space",
+                                  (unsigned)data.length(), (unsigned)address);
+        send_packet("E01");
+        return;
+    }
+
     for (size_t i = 0; i < data.length(); ++i) {
-        if (!DEBUG_WriteMemory(address + static_cast<uint32_t>(i),
-                               static_cast<uint8_t>(data[i]))) {
+        const uint32_t addr = address + static_cast<uint32_t>(i);
+        if (!DEBUG_WriteMemory(addr, static_cast<uint8_t>(data[i]))) {
             /* Bytes before this one already landed. RSP has no way to say
              * how far a partial write got, so report the failure and let the
              * client re-read the region. */
