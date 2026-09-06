@@ -151,6 +151,98 @@ KBD_KEYS QMPServer::qcode_to_kbd(const std::string& qcode) {
 }
 
 // Minimal JSON helpers - just enough for QMP
+
+/* Every string this server puts on the wire goes through here first.
+ * Replies interpolated their strings raw, so a single '"' or '\' anywhere
+ * in a caller- or filesystem-supplied value -- an error message, a save
+ * path, a screenshot destination -- terminated the JSON string early and
+ * emitted a document the client cannot parse. The reply is then lost
+ * entirely, not merely ugly. Windows-style paths reach the backslash case
+ * without anyone trying.
+ *
+ * RFC 8259 requires escaping '"', '\' and everything below 0x20. Bytes at
+ * 0x80 and above are passed through: the payloads here are filesystem paths
+ * and log messages, which are already UTF-8 on every platform this builds
+ * for, and re-encoding them would corrupt non-ASCII filenames. */
+static std::string json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char esc[7];
+                    snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    out += esc;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+/* The inverse, for the values pulled out of an incoming command. A JSON
+ * string ends at the first unescaped '"', and \" and \\ inside it stand for
+ * one character each. Scanning for a bare '"' and returning the bytes
+ * verbatim -- which is what this used to do -- truncated any path
+ * containing a quote at the quote, and doubled every backslash in a
+ * Windows-style path. Escaping the replies is only half a fix if the
+ * request cannot carry the value in the first place. */
+static std::string json_unescape(const std::string& in, size_t start,
+                                 size_t& end_out) {
+    std::string out;
+    size_t i = start;
+    while (i < in.size()) {
+        char c = in[i];
+        if (c == '"') { end_out = i; return out; }
+        if (c != '\\') { out += c; ++i; continue; }
+        if (++i >= in.size()) break;
+        switch (in[i]) {
+            case '"':  out += '"';  ++i; break;
+            case '\\': out += '\\'; ++i; break;
+            case '/':  out += '/';  ++i; break;
+            case 'b':  out += '\b'; ++i; break;
+            case 'f':  out += '\f'; ++i; break;
+            case 'n':  out += '\n'; ++i; break;
+            case 'r':  out += '\r'; ++i; break;
+            case 't':  out += '\t'; ++i; break;
+            case 'u': {
+                /* \uXXXX. Only the Basic Latin range is decoded to a byte;
+                 * anything above 0x7F would need UTF-8 re-encoding and
+                 * surrogate pairing, which no command here has a use for,
+                 * so those are passed through as written rather than
+                 * silently mangled. */
+                if (i + 4 < in.size()) {
+                    const std::string hex = in.substr(i + 1, 4);
+                    if (hex.find_first_not_of("0123456789abcdefABCDEF")
+                        == std::string::npos) {
+                        const unsigned long cp = strtoul(hex.c_str(), NULL, 16);
+                        if (cp <= 0x7F) {
+                            out += static_cast<char>(cp);
+                            i += 5;
+                            break;
+                        }
+                    }
+                }
+                out += "\\u";
+                ++i;
+                break;
+            }
+            default: out += '\\'; break;  // not an escape; keep it literal
+        }
+    }
+    end_out = std::string::npos;
+    return "";  // unterminated string
+}
+
 std::string QMPServer::extract_string(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
@@ -164,10 +256,10 @@ std::string QMPServer::extract_string(const std::string& json, const std::string
     if (pos == std::string::npos) return "";
 
     if (json[pos] == '"') {
-        size_t start = pos + 1;
-        size_t end = json.find('"', start);
+        size_t end = std::string::npos;
+        std::string value = json_unescape(json, pos + 1, end);
         if (end != std::string::npos) {
-            return json.substr(start, end - start);
+            return value;
         }
     }
     return "";
@@ -380,7 +472,8 @@ void QMPServer::send_success() {
 }
 
 void QMPServer::send_error(const std::string& error_class, const std::string& desc) {
-    std::string response = "{\"error\": {\"class\": \"" + error_class + "\", \"desc\": \"" + desc + "\"}}\r\n";
+    std::string response = "{\"error\": {\"class\": \"" + json_escape(error_class)
+                         + "\", \"desc\": \"" + json_escape(desc) + "\"}}\r\n";
     send_response(response);
 }
 
@@ -494,7 +587,7 @@ void QMPServer::handle_query_commands() {
         if (!first) response += ",";
         first = false;
         response += "{\"name\": \"";
-        response += entry.name;
+        response += json_escape(entry.name);
         response += "\"}";
     }
     response += "]}\r\n";
@@ -792,7 +885,8 @@ void QMPServer::handle_memdump(const std::string& cmd) {
         response << "{\"return\": {\"data\": \"" << b64 << "\", \"size\": " << size << "}}\r\n";
     } else {
         // Return file path
-        response << "{\"return\": {\"file\": \"" << file << "\", \"size\": " << size << "}}\r\n";
+        response << "{\"return\": {\"file\": \"" << json_escape(file)
+                 << "\", \"size\": " << size << "}}\r\n";
     }
 
     send_response(response.str());
@@ -866,7 +960,8 @@ void QMPServer::handle_screendump(const std::string& cmd) {
 
         std::string b64 = base64_encode(data);
         response << "{\"return\": {\"data\": \"" << b64 << "\", \"size\": " << data.size()
-                 << ", \"format\": \"png\", \"file\": \"" << screenshot_path << "\"}}\r\n";
+                 << ", \"format\": \"png\", \"file\": \"" << json_escape(screenshot_path)
+                 << "\"}}\r\n";
     } else {
         // Copy to requested file path
         std::ifstream src(screenshot_path, std::ios::binary);
@@ -884,7 +979,8 @@ void QMPServer::handle_screendump(const std::string& cmd) {
         size_t size = check.tellg();
         check.close();
 
-        response << "{\"return\": {\"file\": \"" << file << "\", \"size\": " << size
+        response << "{\"return\": {\"file\": \"" << json_escape(file)
+                 << "\", \"size\": " << size
                  << ", \"format\": \"png\"}}\r\n";
     }
 
@@ -940,7 +1036,7 @@ void QMPServer::handle_savestate(const std::string& cmd) {
     if (SAVESTATE_IsComplete(error)) {
         if (error.empty()) {
             std::ostringstream response;
-            response << "{\"return\": {\"file\": \"" << file << "\"}}\r\n";
+            response << "{\"return\": {\"file\": \"" << json_escape(file) << "\"}}\r\n";
             send_response(response.str());
         } else {
             send_error("GenericError", error);
@@ -1007,7 +1103,7 @@ void QMPServer::handle_loadstate(const std::string& cmd) {
     if (SAVESTATE_IsComplete(error)) {
         if (error.empty()) {
             std::ostringstream response;
-            response << "{\"return\": {\"file\": \"" << file << "\"}}\r\n";
+            response << "{\"return\": {\"file\": \"" << json_escape(file) << "\"}}\r\n";
             send_response(response.str());
         } else {
             send_error("GenericError", error);
@@ -1135,14 +1231,14 @@ void QMPServer::handle_query_status() {
 
     std::ostringstream response;
     response << "{\"return\": {"
-             << "\"status\": \"" << status << "\", "
+             << "\"status\": \"" << json_escape(status) << "\", "
              << "\"running\": " << (running ? "true" : "false") << ", "
              << "\"emulator-paused\": " << (emu_paused ? "true" : "false") << ", "
              << "\"debug\": {"
              << "\"active\": " << (debug_active ? "true" : "false") << ", "
              << "\"paused\": " << (debug_paused ? "true" : "false");
     if (debug_reason) {
-        response << ", \"reason\": \"" << debug_reason << "\"";
+        response << ", \"reason\": \"" << json_escape(debug_reason) << "\"";
     }
     response << "}}}\r\n";
     send_response(response.str());

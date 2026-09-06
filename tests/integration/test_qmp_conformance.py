@@ -235,6 +235,52 @@ def test_a_truncated_state_file_is_reported_as_an_error(qmp, tmp_path):
     assert qmp.execute("query-status") is not None
 
 
+# A directory name carrying both characters that must be escaped in a JSON
+# string. Both are legal in a POSIX filename, and a Windows path reaches the
+# backslash case without trying.
+NASTY = 'qu"ote\\slash'
+
+
+def test_an_error_message_containing_a_quote_is_valid_json(qmp, tmp_path):
+    """send_error interpolated desc straight into the response, so a
+    filesystem path carrying a quote or a backslash emitted JSON the client
+    cannot parse -- the reply is lost, not merely ugly."""
+    missing = tmp_path / NASTY / "nope.sav"
+
+    reply = qmp.execute_raw("loadstate", {"file": str(missing)})
+
+    assert "error" in reply, f"expected an error reply, got {reply}"
+    assert NASTY in reply["error"]["desc"], (
+        f"the path came back mangled: {reply['error']['desc']!r}")
+
+
+def test_a_returned_file_path_containing_a_quote_is_valid_json(qmp, tmp_path):
+    """The savestate/loadstate/screendump/memdump replies echo the path back
+    into the response the same unescaped way."""
+    nasty_dir = tmp_path / NASTY
+    nasty_dir.mkdir()
+    target = nasty_dir / "state.sav"
+
+    result = qmp.execute("savestate", {"file": str(target)})
+    assert result["file"] == str(target), (
+        f"the path did not round-trip: {result['file']!r}")
+    assert target.exists()
+
+    assert qmp.execute("loadstate", {"file": str(target)})["file"] == str(
+        target)
+
+
+def test_a_screendump_path_containing_a_quote_is_valid_json(qmp, tmp_path):
+    """screendump echoes the destination path back too."""
+    nasty_dir = tmp_path / NASTY
+    nasty_dir.mkdir(exist_ok=True)
+    target = nasty_dir / "shot.png"
+
+    result = qmp.execute("screendump", {"file": str(target)})
+    assert result["file"] == str(target), (
+        f"the path did not round-trip: {result['file']!r}")
+
+
 def test_system_reset_is_acknowledged(qmp):
     """system_reset replies immediately and reboots the guest
     asynchronously on the main thread. Assert the ack, then confirm the
