@@ -190,6 +190,51 @@ def test_a_failing_savestate_reports_an_error_and_leaves_the_emulator_alive(
     assert survivor.exists()
 
 
+def test_a_failing_loadstate_reports_an_error_and_leaves_the_emulator_alive(
+        qmp, tmp_path):
+    """SaveState::load()'s epilogue set load_err and then logged only on
+    success -- there was no notifyError() on the failure path at all, unlike
+    save(). A loadstate of a file that is not a state answered
+    {"return": {"file": ...}} as though it had worked. That is the worst
+    kind of wrong answer: anything that loads a state and then measures the
+    guest blames whatever it was measuring."""
+    junk = tmp_path / "not-a-state.sav"
+    junk.write_bytes(b"this is not a zip archive")
+
+    started = time.time()
+    reply = qmp.execute_raw("loadstate", {"file": str(junk)})
+    elapsed = time.time() - started
+
+    assert "error" in reply, (
+        f"loading a file that is not a state reported success: {reply}")
+    desc = reply["error"].get("desc", "")
+    assert "timed out" not in desc, (
+        f"loadstate answered only by hitting its own timeout ({desc!r}); "
+        f"the emulation thread was blocked on a dialog, not reporting")
+    assert elapsed < 10.0, f"the failure took {elapsed:.1f}s to report"
+
+    # Liveness: a modal dialog on the failure path would park the emulation
+    # thread and this would never come back.
+    assert qmp.execute("query-status") is not None
+
+
+def test_a_truncated_state_file_is_reported_as_an_error(qmp, tmp_path):
+    """A state truncated mid-component is a real zip whose members are
+    incomplete, so it fails deeper in load() than an outright bad file --
+    the same epilogue has to catch it."""
+    good = tmp_path / "good.sav"
+    assert qmp.execute("savestate", {"file": str(good)})["file"] == str(good)
+    whole = good.read_bytes()
+
+    truncated = tmp_path / "truncated.sav"
+    truncated.write_bytes(whole[:len(whole) // 2])
+
+    reply = qmp.execute_raw("loadstate", {"file": str(truncated)})
+    assert "error" in reply, (
+        f"loading a truncated state reported success: {reply}")
+    assert qmp.execute("query-status") is not None
+
+
 def test_system_reset_is_acknowledged(qmp):
     """system_reset replies immediately and reboots the guest
     asynchronously on the main thread. Assert the ack, then confirm the

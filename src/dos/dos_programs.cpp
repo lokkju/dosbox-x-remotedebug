@@ -11263,6 +11263,7 @@ void DOS_SetupPrograms(void) {
             "application, which is not supported by the Raw OPL format.");
     MSG_Add("TTF_DBCS_ONLY","This function is only available for the Chinese/Japanese/Korean code pages.");
     MSG_Add("SAVE_FAILED","Failed to save the current state.");
+    MSG_Add("LOAD_FAILED","Failed to load the saved state.");
     MSG_Add("SAVE_CORRUPTED","Save state corrupted! Program may not work.");
     MSG_Add("SAVE_SCREENSHOT","Saved screenshot to the file:\n\n%s");
 

@@ -938,7 +938,28 @@ done:
 	}
 
 	if (!dos_kernel_disabled) flagged_restore((char *)save.c_str());
-	if (!load_err) LOG_MSG("[%s]: Loaded. (Slot %d)", getTime().c_str(), (int)slot+1);
+
+	/* load_err was set all the way down this function and then read by
+	 * nothing: the epilogue logged on success and stayed silent on failure,
+	 * so a load that got nowhere was indistinguishable from one that
+	 * worked. Over the wire that is the worst possible answer -- QMP
+	 * loadstate returned {"return": {...}} for a file that is not a state
+	 * at all, and anything that loads a state and then measures the guest
+	 * blames whatever it was measuring. save() has always reported its
+	 * failures here; load() now does the same.
+	 *
+	 * Interactively this is a visible change: a failed load now opens the
+	 * same error dialog a failed save does, where before it did nothing.
+	 * That is deliberate. A load that fails partway leaves the guest
+	 * holding a mixture of old and new component state, which is exactly
+	 * the condition a user must be told about rather than discover later.
+	 * A remote-driven load takes the savestate_suppress_dialogs path in
+	 * notifyError() instead, so the message goes back to the QMP client
+	 * and no dialog is opened. */
+	if (load_err)
+		notifyError(MSG_Get("LOAD_FAILED"));
+	else
+		LOG_MSG("[%s]: Loaded. (Slot %d)", getTime().c_str(), (int)slot+1);
 }
 
 bool SaveState::isEmpty(size_t slot) const {
