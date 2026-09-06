@@ -552,5 +552,74 @@ def test_no_ack_mode_does_not_survive_a_reconnect(emulator):
         sock.close()
 
 
+# -- `m` must bound the byte count a client can ask for --------------------
+
+# qSupported advertises PacketSize=3fff, so the largest reply body the stub
+# promises to emit is 0x3fff bytes. `m` answers two hex digits per byte, so
+# the most bytes that fit is 0x3fff / 2 == 8191.
+MAX_READ_BYTES = 0x3FFF // 2
+
+
+def test_an_oversized_memory_read_does_not_kill_the_emulator(emulator):
+    """The reply used to be built in a stack VLA sized from the requested
+    length, so `m0,ffffff` asked for a ~32MB stack frame and the emulator
+    died with SIGSEGV. One legal packet from a connected client took the
+    whole process down."""
+    gdb = emulator.gdb()
+    gdb.halt()
+    assert gdb.send("m0,ffffff") == "E01", (
+        "an absurdly long m should be refused, not attempted")
+    assert emulator._proc.poll() is None, (
+        f"the emulator died servicing an oversized m "
+        f"(exit {emulator._proc.poll()})")
+    assert gdb.send("m0,4") != "", "the stub stopped answering after the refusal"
+
+
+def test_memory_read_is_bounded_by_the_advertised_packet_size(gdb):
+    """A reply longer than the advertised PacketSize is one the client is
+    entitled to reject. The stub used to answer m0,3fff with 32766 hex
+    digits -- double what it said it could send."""
+    gdb.halt()
+    assert gdb.send(f"m0,{MAX_READ_BYTES + 1:x}") == "E01", (
+        "a read one byte past the advertised capacity should be refused")
+    reply = gdb.send(f"m0,{MAX_READ_BYTES:x}")
+    assert not reply.startswith("E"), (
+        f"a read at exactly the advertised capacity should succeed, got "
+        f"{reply[:16]!r}")
+    assert len(reply) // 2 == MAX_READ_BYTES
+    assert len(reply) <= 0x3FFF, (
+        f"reply body is {len(reply)} bytes, past the advertised PacketSize")
+
+
+# -- addresses must not wrap round the top of the address space ------------
+
+def test_memory_read_stops_at_the_top_of_the_address_space(gdb):
+    """`address + read` was computed in uint32_t, so a read starting near
+    0xFFFFFFFF wrapped and returned bytes from address 0 as though they were
+    contiguous with the top of memory."""
+    gdb.halt()
+    bottom = gdb.send("m0,8")
+    reply = gdb.send("mfffffffe,8")
+    if reply.startswith("E"):
+        return  # nothing readable up there on this build; nothing to wrap
+    got = len(reply) // 2
+    assert got <= 2, (
+        f"a read starting at 0xFFFFFFFE can cover at most 2 bytes, got {got} "
+        f"({reply!r}) -- the address wrapped to 0")
+    assert not reply.endswith(bottom[:12]), (
+        f"the tail of the reply is the bottom of memory: {reply!r}")
+
+
+def test_memory_write_stops_at_the_top_of_the_address_space(gdb):
+    """The same uint32_t addition in M would scribble over address 0 while
+    reporting OK for a write at the top of memory."""
+    gdb.halt()
+    before = gdb.send("m0,8")
+    gdb.send("Mfffffffe,8:0102030405060708")
+    assert gdb.send("m0,8") == before, (
+        "a write at 0xFFFFFFFE modified memory at address 0 -- it wrapped")
+
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

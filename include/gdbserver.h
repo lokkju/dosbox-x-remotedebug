@@ -15,6 +15,18 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+/* The largest reply body this stub will emit, and the value it advertises
+ * as PacketSize in qSupported. The two must agree: a client is entitled to
+ * size its buffers from the advertisement and reject anything longer. */
+static const uint32_t GDB_MAX_PACKET_SIZE = 0x3fff;
+
+/* `m` answers two hex digits per byte, so this is the most bytes a single
+ * read can return without overrunning the advertised packet size. It is
+ * also the ceiling on the length a client may request: before it existed,
+ * an unbounded length from the wire sized a stack VLA in send_packet and
+ * `m0,ffffff` crashed the emulator. */
+static const uint32_t GDB_MAX_READ_BYTES = GDB_MAX_PACKET_SIZE / 2;
+
 // Action requested by GDB client, returned from poll()
 enum class GDBAction {
     NONE,           // No action needed, continue polling

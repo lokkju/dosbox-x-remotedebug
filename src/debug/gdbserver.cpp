@@ -291,10 +291,17 @@ void GDBServer::send_packet(const std::string& packet) {
         checksum += static_cast<uint8_t>(c);
     }
 
-    char response[packet.length() + 5];
-    snprintf(response, sizeof(response), "$%s#%02x", packet.c_str(), checksum);
+    /* This used to be `char response[packet.length() + 5]` -- a stack VLA
+     * whose size came straight off the wire. handle_read_memory took an
+     * unbounded byte count from the client and answered two hex digits per
+     * byte, so `m0,ffffff` asked for a ~32MB stack frame and the emulator
+     * died with SIGSEGV. A std::string has no such ceiling; the requested
+     * length is bounded separately in handle_read_memory. */
+    char checksum_text[4];
+    snprintf(checksum_text, sizeof(checksum_text), "%02x", checksum);
+    const std::string response = "$" + packet + "#" + checksum_text;
 
-    write(client_fd, response, strlen(response));
+    write(client_fd, response.data(), response.size());
 
     // In non-blocking mode, we don't wait for ACK synchronously
     // The ACK will be in recv_buffer on next poll()
@@ -484,6 +491,21 @@ void GDBServer::handle_read_memory(const std::string& args) {
     uint32_t address = std::stoul(args.substr(0, comma), nullptr, 16);
     uint32_t length = std::stoul(args.substr(comma + 1), nullptr, 16);
 
+    /* The reply is two hex digits per byte, so the largest read that still
+     * fits inside the PacketSize this stub advertises in qSupported is
+     * GDB_MAX_PACKET_SIZE / 2. Refusing anything larger keeps the reply
+     * within what the client was promised, and -- with the VLA in
+     * send_packet gone -- keeps a client-chosen length from sizing anything
+     * unbounded. gdb itself splits long reads into PacketSize-sized chunks,
+     * so a conforming client never trips this. */
+    if (length > GDB_MAX_READ_BYTES) {
+        LOG(LOG_REMOTE, LOG_WARN)("GDBServer: m rejected: %u bytes exceeds the "
+                                  "%u byte limit implied by PacketSize",
+                                  (unsigned)length, (unsigned)GDB_MAX_READ_BYTES);
+        send_packet("E01");
+        return;
+    }
+
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
 
@@ -598,9 +620,13 @@ void GDBServer::handle_query(const std::string& cmd) {
          * handle_breakpoint refuses Z1-Z4 outright. Advertising less is
          * always safe; add either one back only together with the
          * annotation it promises. */
-        send_packet("PacketSize=3fff;vContSupported+;"
-                    "QStartNoAckMode+;dosbox-x-linear-bp+;"
-                    "dosbox-x-eip-offset+");
+        /* PacketSize is derived from the same constant handle_read_memory
+         * enforces, so the advertisement and the limit cannot drift apart. */
+        std::stringstream supported;
+        supported << "PacketSize=" << std::hex << GDB_MAX_PACKET_SIZE
+                  << ";vContSupported+;QStartNoAckMode+;dosbox-x-linear-bp+;"
+                     "dosbox-x-eip-offset+";
+        send_packet(supported.str());
     } else if (cmd.substr(0, 11) == "fThreadInfo") {
         send_packet("m1");
     } else if (cmd.substr(0, 11) == "sThreadInfo") {
