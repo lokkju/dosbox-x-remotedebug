@@ -160,6 +160,36 @@ def test_savestate_then_loadstate_round_trips(qmp, tmp_path):
     assert load_result["file"] == str(target)
 
 
+def test_a_failing_savestate_reports_an_error_and_leaves_the_emulator_alive(
+        qmp, tmp_path):
+    """SaveState::save() reports most failures through notifyError(), which
+    opens a modal message box. A modal dialog waits for a click, so on a
+    headless host it parks the emulation thread forever: no error, no crash,
+    no further GDB or QMP progress. Save into a directory that does not
+    exist -- zipOpen fails, which is the same failure branch the dialog sat
+    on -- then prove the emulator is still executing afterwards."""
+    doomed = tmp_path / "no-such-directory" / "doomed.sav"
+
+    started = time.time()
+    reply = qmp.execute_raw("savestate", {"file": str(doomed)})
+    elapsed = time.time() - started
+
+    assert "error" in reply, f"a save that cannot be written returned {reply}"
+    desc = reply["error"].get("desc", "")
+    assert "timed out" not in desc, (
+        f"savestate answered only by hitting its own timeout ({desc!r}); "
+        f"the emulation thread was blocked, not reporting")
+    assert elapsed < 10.0, f"the failure took {elapsed:.1f}s to report"
+    assert not doomed.exists()
+
+    # Liveness: this second save only completes if the emulation thread is
+    # still draining pending requests, which a modal dialog would prevent.
+    survivor = tmp_path / "survivor.sav"
+    assert qmp.execute("savestate", {"file": str(survivor)})["file"] == str(
+        survivor)
+    assert survivor.exists()
+
+
 def test_system_reset_is_acknowledged(qmp):
     """system_reset replies immediately and reboots the guest
     asynchronously on the main thread. Assert the ack, then confirm the

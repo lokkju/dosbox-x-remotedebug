@@ -66,6 +66,29 @@ static std::string savestate_result_error;
 static std::atomic<bool> savestate_request_complete{false};
 static std::mutex savestate_mutex;
 static std::condition_variable savestate_cv;
+
+/* The save/load failure paths report through notifyError(), which opens a
+ * modal message box. A modal dialog blocks the emulation thread until a human
+ * dismisses it, and under a headless video driver nobody ever can: the
+ * emulator then stops executing, stops answering GDB and QMP, and never
+ * recovers. While a remote-debug request is being serviced the message is
+ * captured here instead and handed back to the requesting client as the
+ * command's error. Only the remote-driven path is affected; an interactive
+ * save or load still shows the dialog. */
+static bool savestate_suppress_dialogs = false;
+static std::string savestate_suppressed_error;
+
+namespace {
+	struct SaveStateDialogSuppressor {
+		SaveStateDialogSuppressor() {
+			savestate_suppressed_error.clear();
+			savestate_suppress_dialogs = true;
+		}
+		~SaveStateDialogSuppressor() {
+			savestate_suppress_dialogs = false;
+		}
+	};
+}
 #endif
 void refresh_slots(void);
 void GFX_LosingFocus(void), GFX_ReleaseMouse(void), MAPPER_ReleaseAllKeys(void), resetFontSize(void);
@@ -160,6 +183,14 @@ namespace
 	void notifyError(const std::string& message, bool log=true)
 	{
 		if (log) LOG_MSG("%s",message.c_str());
+#if C_REMOTEDEBUG
+		if (savestate_suppress_dialogs) {
+			/* Never block the emulation thread on a dialog for a request that
+			 * arrived over the wire: keep the first message for the client. */
+			if (savestate_suppressed_error.empty()) savestate_suppressed_error = message;
+			return;
+		}
+#endif
 		systemmessagebox("Error",message.c_str(),"ok","error", 1);
 	}
 
@@ -374,6 +405,13 @@ bool SAVESTATE_CheckPendingRequest() {
     noremark_save_state = true;   // Skip the save remark dialog
     force_load_state = true;      // Skip load compatibility dialogs
 
+    /* SaveState::save()/load() report most failures by calling notifyError()
+     * rather than by throwing, so the catch blocks below are not enough on
+     * their own: without this the emulation thread parks on a modal dialog
+     * that no automated client can dismiss. Suppression ends when this
+     * function returns. */
+    SaveStateDialogSuppressor no_dialogs;
+
     std::string error;
     try {
         if (req == SaveStateRequest::SAVE) {
@@ -397,6 +435,8 @@ bool SAVESTATE_CheckPendingRequest() {
         error = "Unknown exception";
         LOG_MSG("SAVESTATE: Unknown exception caught");
     }
+    if (error.empty() && !savestate_suppressed_error.empty())
+        error = savestate_suppressed_error;
 
     // Restore previous settings
     savefilename = old_savefilename;
