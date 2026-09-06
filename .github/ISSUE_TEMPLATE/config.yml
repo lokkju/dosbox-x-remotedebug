@@ -1,0 +1,21 @@
+# This repository is a FORK. It exists to carry the GDB/QMP remote-debug
+# subsystem, and its issue tracker is scoped to that work only. General
+# DOSBox-X reports belong upstream, where the maintainers and the wider user
+# base are -- filing them here means nobody who can act on them will see it.
+blank_issues_enabled: false
+contact_links:
+  - name: General DOSBox-X bug (not remote-debug)
+    url: https://github.com/joncampbell123/dosbox-x/issues/new/choose
+    about: >-
+      Emulation, video, audio, DOS/BIOS, the GUI, builds, or anything not part
+      of the GDB/QMP remote-debug subsystem. Report it upstream -- this fork's
+      tracker is not watched for general issues.
+  - name: DOSBox-X question or feature request
+    url: https://github.com/joncampbell123/dosbox-x/issues/new/choose
+    about: >-
+      Questions and feature requests about DOSBox-X itself go upstream.
+  - name: dbxdebug (the Python client library)
+    url: https://github.com/lokkju/dbxdebug/issues
+    about: >-
+      Bugs in the Python client, session lifecycle, or CLI belong in dbxdebug,
+      not here. This tracker is for the C++ servers.

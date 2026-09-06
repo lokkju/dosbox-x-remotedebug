@@ -141,3 +141,14 @@ contrib/macos/dosbox-x.plist
 # ignore default dosbox config files (used for manual testing)
 /dosbox-x.conf
 /src/dosbox-x.conf
+
+# Beads issue database: local tooling, not part of the source tree
+.beads/
+
+# Python bytecode caches (e.g. tests/integration/)
+__pycache__/
+*.pyc
+
+# Internal planning documents: local working notes, not part of the source
+# tree. Specs under docs/superpowers/specs/ remain tracked.
+docs/superpowers/plans/
