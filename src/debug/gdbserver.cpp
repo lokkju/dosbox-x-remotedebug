@@ -28,6 +28,27 @@
 #include "logging.h"
 
 // Helper functions
+
+/* EAGAIN and EWOULDBLOCK are the same value on Linux, so testing both with ||
+ * trips -Wlogical-op. They are permitted to differ, so both are still
+ * checked, just not in one expression. */
+static inline bool would_block(int err) {
+    if (err == EAGAIN) return true;
+#if EWOULDBLOCK != EAGAIN
+    if (err == EWOULDBLOCK) return true;
+#endif
+    return false;
+}
+
+/* The GDB stub is best-effort on the write side: a short write or a peer that
+ * vanished mid-packet is handled by the client timing out and reconnecting,
+ * not by retrying here. Swallow the result explicitly so the warning does not
+ * hide a real one. */
+static inline void write_ignore(int fd, const void* buf, size_t len) {
+    ssize_t unused = write(fd, buf, len);
+    (void)unused;
+}
+
 static inline uint32_t swap32(uint32_t x) {
     return (((x >> 24) & 0x000000ff) |
             ((x >> 8) & 0x0000ff00) |
@@ -118,7 +139,7 @@ bool GDBServer::try_accept() {
 
     int new_fd = accept(server_fd, (struct sockaddr*)&address, &addrlen);
     if (new_fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (would_block(errno)) {
             return false;  // No pending connection
         }
         LOG(LOG_REMOTE, LOG_ERROR)("GDBServer: accept failed: %s", strerror(errno));
@@ -208,7 +229,7 @@ bool GDBServer::receive_data() {
             // Connection closed
             return false;
         } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (would_block(errno)) {
                 // No more data available
                 return true;
             }
@@ -285,14 +306,14 @@ std::string GDBServer::extract_packet() {
         LOG(LOG_REMOTE, LOG_WARN)("GDBServer: Checksum mismatch! received 0x%02x, calculated 0x%02x",
                                   received_checksum, calculated_checksum);
         if (!noack_mode) {
-            write(client_fd, "-", 1);
+            write_ignore(client_fd, "-", 1);
         }
         return "";
     }
 
     // Send ACK
     if (!noack_mode) {
-        write(client_fd, "+", 1);
+        write_ignore(client_fd, "+", 1);
     }
 
     LOG(LOG_REMOTE, LOG_DEBUG)("GDBServer: << %s", packet.c_str());
@@ -319,7 +340,7 @@ void GDBServer::send_packet(const std::string& packet) {
     snprintf(checksum_text, sizeof(checksum_text), "%02x", checksum);
     const std::string response = "$" + packet + "#" + checksum_text;
 
-    write(client_fd, response.data(), response.size());
+    write_ignore(client_fd, response.data(), response.size());
 
     // In non-blocking mode, we don't wait for ACK synchronously
     // The ACK will be in recv_buffer on next poll()
