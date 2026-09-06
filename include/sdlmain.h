@@ -24,6 +24,12 @@ enum SCREEN_TYPES {
 #endif
     ,SCREEN_TTF
     ,SCREEN_GAMELINK
+#if C_DIRECT3D && defined(C_SDL2)
+    ,SCREEN_DIRECT3D11
+#endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+    , SCREEN_METAL
+#endif
 };
 
 enum AUTOLOCK_FEEDBACK
@@ -163,7 +169,6 @@ struct SDL_Block {
     } texture;
 #endif
     int displayNumber = 0;
-    SDL_cond *cond = NULL;
     struct {
         bool autolock = false;
         AUTOLOCK_FEEDBACK autolock_feedback = (AUTOLOCK_FEEDBACK)0;

@@ -84,6 +84,9 @@ extern uint16_t DOSBOXID_VAR dosbox_id_baseio;
 # define DOSBOX_ID_REG_VGAIG_CTL_3DA_LOCKOUT            (1UL << 2UL)    /* lock out access to 3BAh/3DAh */
 # define DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT            (1UL << 3UL)    /* lock out access to DAC registers */
 # define DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE_REFRESH       (1UL << 4UL)    /* override refresh rate */
+# define DOSBOX_ID_REG_VGAIG_CTL_ACPAL_BYPASS           (1UL << 5UL)    /* for 16-color planar modes, bypass the attribute controller palette mapping */
+# define DOSBOX_ID_REG_VGAIG_CTL_VBEMODESET_DISABLE     (1uL << 6UL)    /* disable VESA BIOS modesetting, intended for the Windows driver */
+# define DOSBOX_ID_REG_VGAIG_CTL_A0000_FORCE            (1UL << 7UL)    /* Force VGA memory map to A0000-AFFFF regardless of VGA registers */
 #define DOSBOX_ID_REG_VGAIG_DISPLAYSIZE                 (0x00684591UL)  /* integrated device width/height (16:16 = HEIGHT:WIDTH) */
 #define DOSBOX_ID_REG_VGAIG_HVTOTALADD                  (0x00684592UL)  /* integrated device add to width/height to get htotal/vtotal = (16:16 V:H) */
 #define DOSBOX_ID_REG_VGAIG_FMT_BYTESPERSCANLINE        (0x00684593UL)  /* integrated device fmt/bytes per scanline (16:16 FMT:BYTESPERSCANLINE) */
@@ -98,10 +101,16 @@ extern uint16_t DOSBOXID_VAR dosbox_id_baseio;
 # define DOSBOX_ID_REG_VGAIG_FMT_24BPP8                 (0x06UL << 16UL)/* 24bpp 8:8:8 */
 # define DOSBOX_ID_REG_VGAIG_FMT_32BPP8                 (0x07UL << 16UL)/* 32bpp 8:8:8:8 */
 # define DOSBOX_ID_REG_VGAIG_FMT_32BPP10                (0x08UL << 16UL)/* 32bpp 2:10:10:10 */
+# define DOSBOX_ID_REG_VGAIG_FMT_1BPP4PLANE             (0x09UL << 16UL)/* 1bpp planar */
 #define DOSBOX_ID_REG_VGAIG_REFRESHRATE                 (0x00684594UL)  /* integrated device refresh rate as a 16.16 fixed point number */
 #define DOSBOX_ID_REG_VGAIG_DISPLAYOFFSET               (0x00684595UL)  /* display video memory offset */
 #define DOSBOX_ID_REG_VGAIG_HVPELSCALE                  (0x00684596UL)  /* h/v scale and h/v pel (8:8:8:8 = vscale:hscale:vpel:hpel) */
 #define DOSBOX_ID_REG_VGAIG_BANKWINDOW                  (0x00684597UL)  /* bank switching window offset (4KB granularity) */
+#define DOSBOX_ID_REG_VGAIG_ASPECTRATIO                 (0x00684598UL)  /* display aspect ratio (16:16 = h:w), set to zero for square pixels */
+#define DOSBOX_ID_REG_VGAIG_CAPS                        (0x00684599UL)  /* read-only capabilities, 0 if machine type is not DOSBox IG */
+# define DOSBOX_ID_REG_VGAIG_CAPS_ENABLED               (1UL << 0UL)    /* DOSBox IG is enabled (machine=svga_dosbox) */
+#define DOSBOX_ID_REG_VGAIG_RBANKWINDOW                 (0x0068459AUL)  /* read bank switching window offset (4KB granularity) */
+#define DOSBOX_ID_REG_VGAIG_WBANKWINDOW                 (0x0068459BUL)  /* write bank switching window offset (4KB granularity) */
 #define DOSBOX_ID_REG_GET_VGA_SIZE                      (0x006845C0UL)  /* size of the VGA screen */
 #define DOSBOX_ID_REG_GET_WINDOW_SIZE                   (0x006845FFUL)  /* size of the emulator window (to give USER_MOUSE_CURSOR meaning) */
 

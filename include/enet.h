@@ -1456,7 +1456,14 @@ extern "C" {
     }
 
     void * enet_malloc(size_t size) {
-        void *memory = callbacks.malloc(size);
+        void *memory;
+
+        if (size == 0) {
+            callbacks.no_memory();
+            return NULL;
+        }
+
+        memory = callbacks.malloc(size);
 
         if (memory == NULL) {
             callbacks.no_memory();
@@ -1550,6 +1557,9 @@ extern "C" {
             packet->data = (enet_uint8 *)data;
         }
         else {
+            if (dataLength > SIZE_MAX - sizeof(ENetPacket)) {
+                return NULL;
+            }
             packet = (ENetPacket *)enet_malloc(sizeof (ENetPacket) + dataLength);
             if (packet == NULL) {
                 return NULL;

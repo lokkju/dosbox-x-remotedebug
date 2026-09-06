@@ -69,10 +69,16 @@ class EmulatorLaunchError(RuntimeError):
 
 class Emulator:
     START_TIMEOUT = 30.0
+    BOOT_TIMEOUT = 30.0
     PORT_RETRIES = 3
 
+    # Text-mode screen, the one piece of guest state that says the shell has
+    # actually started.
+    TEXT_VRAM = 0xB8000
+    TEXT_PAGE_BYTES = 80 * 25 * 2
+
     def __init__(self, executable=None, extra_conf: str = "",
-                 mounts: dict = None, boot_settle: float = 2.5):
+                 mounts: dict = None, boot_settle: float = 0.5):
         self.executable = Path(executable or DEFAULT_EXECUTABLE)
         self.extra_conf = extra_conf
         self.mounts = dict(mounts or {})
@@ -127,7 +133,7 @@ class Emulator:
             try:
                 self._spawn()
                 self._wait_for_ports()
-                time.sleep(self.boot_settle)
+                self._wait_for_boot()
                 self._stopped = False
                 return self
             except EmulatorLaunchError as exc:
@@ -161,6 +167,42 @@ class Emulator:
             time.sleep(0.1)
         raise EmulatorLaunchError(
             f"ports {self.gdb_port}/{self.qmp_port} never accepted")
+
+    def _wait_for_boot(self) -> None:
+        """Wait until the guest has actually reached the DOS prompt.
+
+        This used to be a flat 2.5s sleep, which was roughly how long the
+        boot took -- so the margin was a fraction of a second and any extra
+        load lost the race. A test that starts early sees a blank screen,
+        and a savestate taken before VM_Boot_DOSBox_Kernel has run
+        MSCDEX_Startup serialises a half-built DOS and fails.
+
+        Poll the text screen instead. The shell banner is written after the
+        DOS kernel, MSCDEX and COMMAND.COM are all up, so its appearance is
+        the readiness signal, and the wait is no longer than it has to be.
+        The probe is its own short-lived GDB connection: the test's own
+        client connects afterwards, on a fresh session.
+        """
+        probe = RawGDB(port=self.gdb_port, timeout=5.0)
+        probe.connect()
+        try:
+            deadline = time.time() + self.BOOT_TIMEOUT
+            while time.time() < deadline:
+                try:
+                    vram = probe.read_memory(self.TEXT_VRAM,
+                                             self.TEXT_PAGE_BYTES)
+                except Exception:
+                    vram = b""
+                if any(33 <= vram[i] < 127 for i in range(0, len(vram), 2)):
+                    break
+                time.sleep(0.1)
+            else:
+                raise EmulatorLaunchError(
+                    "guest never drew anything to the text screen; "
+                    "it did not reach the DOS prompt")
+        finally:
+            probe.close()
+        time.sleep(self.boot_settle)
 
     def stop(self) -> None:
         if self._stopped:

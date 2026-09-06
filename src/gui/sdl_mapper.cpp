@@ -339,6 +339,15 @@ void                                            WindowsTaskbarResetPreviewRegion
 
 #if defined(MACOSX)
 void                        macosx_reload_touchbar(void);
+#if defined(C_SDL2) && C_METAL
+void OUTPUT_Metal_Shutdown();
+void change_output(int);
+#endif
+#endif
+
+#if C_DIRECT3D && C_SDL2
+void OUTPUT_DIRECT3D11_Shutdown();
+void change_output(int);
 #endif
 
 bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
@@ -1231,7 +1240,9 @@ void setScanCode(Section_prop * section) {
 #endif //defined(MACOSX)
 }
 void loadScanCode();
+#if !defined(OSFREE)
 const char* DOS_GetLoadedLayout(void);
+#endif
 bool load=false;
 bool prev_ret;
 #endif // !defined(C_SDL2)
@@ -1245,6 +1256,7 @@ bool useScanCode() {
 	else if (!usescancodes)
 		return false;
 	else {
+# if !defined(OSFREE)
 		const char* layout_name = DOS_GetLoadedLayout();
 		bool ret = layout_name != NULL && !IS_PC98_ARCH;
 		if (!load)
@@ -1257,6 +1269,9 @@ bool useScanCode() {
 			load=true;
 		}
 		return ret;
+# else
+		return false;
+# endif
 	}
 #endif
 }
@@ -1817,7 +1832,7 @@ public:
         pos_axis_lists=new CBindList[MAXAXIS];
         neg_axis_lists=new CBindList[MAXAXIS];
         button_lists=new CBindList[MAXBUTTON];
-        hat_lists=new CBindList[4];
+        hat_lists=new CBindList[MAXHAT*4]; /* 4 binding lists (one per direction) per hat, for up to MAXHAT hats */
         Bitu i;
         for (i=0; i<MAXBUTTON; i++) {
             button_autofire[i]=0;
@@ -5559,6 +5574,21 @@ void MAPPER_RunInternal() {
     WindowsTaskbarUpdatePreviewRegion();
 #endif
 
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+    if(sdl.desktop.want_type == SCREEN_METAL){
+        OUTPUT_Metal_Shutdown();
+#if defined(C_OPENGL)
+        change_output(3);
+#endif
+        change_output(14);
+    }  
+#endif
+#if C_DIRECT3D && C_SDL2
+    if(sdl.desktop.want_type == SCREEN_DIRECT3D11) {
+        OUTPUT_DIRECT3D11_Shutdown();
+        change_output(13);
+    }
+#endif
 //  KEYBOARD_ClrBuffer();
     GFX_LosingFocus();
 
@@ -5941,21 +5971,21 @@ void MAPPER_StartUp() {
         item.set_text(MSG_Get("SAVE_MAPPER_FILE"));
     }
 
-    mapperMenu.displaylist_clear(mapperMenu.display_list);
+    mapperMenu.displaylist_clear(mapperMenu.unassigned_item_handle);
 
     mapperMenu.displaylist_append(
-        mapperMenu.display_list,
+        mapperMenu.unassigned_item_handle,
         mapperMenu.get_item_id_by_name("MapperMenu"));
 
     {
         mapperMenu.displaylist_append(
-            mapperMenu.get_item("MapperMenu").display_list, mapperMenu.get_item_id_by_name("ExitMapper"));
+            mapperMenu.get_item_id_by_name("MapperMenu"), mapperMenu.get_item_id_by_name("ExitMapper"));
 
         mapperMenu.displaylist_append(
-            mapperMenu.get_item("MapperMenu").display_list, mapperMenu.get_item_id_by_name("_separator_"));
+            mapperMenu.get_item_id_by_name("MapperMenu"), mapperMenu.get_item_id_by_name("_separator_"));
 
         mapperMenu.displaylist_append(
-            mapperMenu.get_item("MapperMenu").display_list, mapperMenu.get_item_id_by_name("SaveMapper"));
+            mapperMenu.get_item_id_by_name("MapperMenu"), mapperMenu.get_item_id_by_name("SaveMapper"));
     }
 #endif
 

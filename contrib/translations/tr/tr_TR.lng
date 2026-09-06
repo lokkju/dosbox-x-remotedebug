@@ -1,6 +1,6 @@
 :DOSBOX-X:LANGUAGE:Turkish (Turkey)
 :DOSBOX-X:CODEPAGE:857
-:DOSBOX-X:VERSION:2025.12.01
+:DOSBOX-X:VERSION:2026.08.31
 :DOSBOX-X:REMARK:
 :AUTOEXEC_CONFIGFILE_HELP
 Lines in this section will be run at startup.
@@ -50,6 +50,9 @@ Tamam
 :CLOSE
 Kapat
 .
+:THEME
+Tema
+.
 :DEBUGCMD
 Hata ayıklayıcısı komutu
 .
@@ -78,7 +81,7 @@ Yapılandırmayı kaydet
 Dil dosyasını kaydet
 .
 :SAVE_RESTART
-Kaydet/yeniden başl.
+Kaydet/Yen. başlat
 .
 :PASTE_CLIPBOARD
 Panoyu yapıştır
@@ -87,7 +90,7 @@ Panoyu yapıştır
 Geçmişi iliştir
 .
 :EXECUTE_NOW
-Şimdi çalıştır
+Şimdi yürüt
 .
 :ADDITION_CONTENT
 Ek içerik:
@@ -419,7 +422,7 @@ Halihazırda PS/2 kapısına takılı.
 
 .
 :PROGRAM_MOUSE_NOINSTALLED
-Sürücü yüklü değil.
+Sürücü kurulu değil.
 
 .
 :PROGRAM_MOUSE_HELP
@@ -1222,29 +1225,29 @@ Yanlış -size veya -chs argümanları.
 
 .
 :PROGRAM_KEYB_INFO_LAYOUT
-%i kod sayfası %s dizilimi için yüklendi
+%i kod sayfası %s yerleşimi için yüklendi
 
 .
 :PROGRAM_KEYB_SHOWHELP
 Klavyeyi belirli bir dil için yapılandırır.
 
 Usage: ←[32;1mKEYB←[0m [klavye dizilimi kimliği [kod sayfası numarası [kod sayfası dosyası]]]
-  layout ID        Yüklenecek düzen veya klavye dosyasının (.kl) adı
+  layout ID        Yüklenecek yerleşim veya klavye dosyasının (.kl) adı
   codepage number  Yüklenecek kod sayfası sayısı
   codepage file    Belirtilen kod sayfası bilgilerini içeren .cpi/.cpx dosyası
   (.kl, .cpi/.cpx dosyaları dosbox-x dizininin altına yerleştirilecektir yürütülebilir dosya var.)
 
 Some examples:
-  ←[32;1mKEYB←[0m          Şu anda yüklü kod sayfasını görüntüle.
-  ←[32;1mKEYB tr←[0m       Türkçe (TR-Q) dizilimini uygun kod sayfası ile yükle.
-  ←[32;1mKEYB tr440←[0m    Türkçe (TR-F) dizilimini uygun kod sayfası ile yükle.
-  ←[32;1mKEYB tr 857←[0m   Türkçe (TR-Q) dizilimin 857 kod sayfası ile yükle.
-  ←[32;1mKEYB tr 857 mycp.cpi←[0m Yukarıdakinin aynısı, mycp.cpi dosyası ile.
-  ←[32;1mKEYB tr_mod 857←[0m      tr_mod.kl'den klavye düzenini yükleyin, kod sayfası 857'yi kullanın.
+  ←[32;1mKEYB←[0m          Şu anda yüklü kod sayfasını görüntüle
+  ←[32;1mKEYB tr←[0m       Türkçe (TR-Q) yerleşimini uygun kod sayfası ile yükle
+  ←[32;1mKEYB tr440←[0m    Türkçe (TR-F) yerleşimini uygun kod sayfası ile yükle
+  ←[32;1mKEYB tr 857←[0m   Türkçe (TR-Q) yerleşimini 857 kod sayfası ile yükle
+  ←[32;1mKEYB tr 857 mycp.cpi←[0m Yukarıdakinin aynısı, mycp.cpi dosyası ile
+  ←[32;1mKEYB tr_mod 857←[0m      tr_mod.kl'den klavye yerleşimini yükle, kod sayfası 857'yi kullan
 
 .
 :PROGRAM_KEYB_NOERROR
-%s klavye dizilimi %i kod sayfası için yüklendi
+%s klavye yerleşimi, %i kod sayfası için yüklendi
 
 .
 :PROGRAM_KEYB_FILENOTFOUND
@@ -1257,11 +1260,11 @@ Klavye dosyası %s geçersiz
 
 .
 :PROGRAM_KEYB_LAYOUTNOTFOUND
-Şu kod sayfası için %s içinde bir dizilim bulunamadı: %i
+Şu kod sayfası için %s içinde bir yerleşim bulunamadı: %i
 
 .
 :PROGRAM_KEYB_INVCPFILE
-%s dizilimi için geçersiz veya olmayan kod sayfası dosyası
+%s yerleşimi için geçersiz veya olmayan kod sayfası dosyası
 
 
 .
@@ -1518,14 +1521,14 @@ Belirtilen tarih doğru değil.
 Geçerli tarih: 
 .
 :SHELL_CMD_DATE_SETHLP
-Değiştirmek için 'date %s' yazın.
+Değiştirmek için "date %s" yazın.
 
 .
 :SHELL_CMD_DATE_HELP_LONG
 DATE [[/T] [/H] [/S] | tarih]
   tarih:      Ayarlanacak yeni tarih
   /S:         Ana makine tarih ve zamanını DOS zamanı olarak kullan
-  /F:         DOSBox-X dahili zamanına geç (/S'in karşıtı)
+  /F:         DOSBox-X içsel zamanına geç (/S'in karşıtı)
   /T:         Yalnızca tarihi görüntüle
   /H:         Ana makine ile eşitle
 
@@ -1553,7 +1556,7 @@ TIME [[/T] [/H] | zaman]
 
 .
 :SHELL_CMD_MKDIR_EXIST
-Dizin halihazırda mevcut - %s
+Dizin halihazırda var - %s
 
 .
 :SHELL_CMD_MKDIR_ERROR
@@ -1764,7 +1767,7 @@ Kabuk komutları için ←[32mHELP←[37m, kısa bir giriş için ←[32mINTRO�
 .
 :SHELL_STARTUP_TEXT2_PC98
 ←[33mYapılandırma aracı←[37m'nı aracını başlatmak için ←[31mhost+C←[37m kullanın. Ana makine düğmesi ←[32mF11←[37m'dir.    
-←[33mEşlem düzenleyici←[37m'yi etkinleştirmek için ←[31mhost+M←[37m kullanın.    
+←[33mEşlem düzenleyicisi←[37m'ni etkinleştirmek için ←[31mhost+M←[37m kullanın.  
 Pencereli ve tam ekran kipi arasında geçiş yapmak için ←[31mhost+F←[37m kullanın.      
 Öykünülen CPU hızını ayarlamak için ←[31mhost+artı←[37m ve ←[31mhost+eksi←[37m kullanın.   
 .
@@ -1791,7 +1794,7 @@ Komutların listesini görmek için ←[32mHELP←[37m, kısa bir giriş için �
 .
 :SHELL_STARTUP_TEXT2
 -←[31mF11←[37m+←[31mF←[37m←[37m kestirmesini kullanarak pencereli/tam ekran kip arasında geçiş yapın.
--←[31mF11←[37m+←[31mC←[37m←[37m ←[33mYapılandırma aracı←[37m'nı, ←[31mF11←[37m+←[31mM←[37m←[37m ←[33mEşlem düzenleyici←[37m'yi çalıştırır.        
+-←[31mF11←[37m+←[31mC←[37m←[37m ←[33mYapılandırma aracı←[37m'nı, ←[31mF11←[37m+←[31mM←[37m←[37m ←[33mEşlem düzenleyicisi←[37m'ni çalıştırır.      
 -←[31mF11←[37m+←[31martı←[37m←[37m veya ←[31mF11←[37m+←[31meksi←[37m←[37m düğmeleri ile öykünme hızını artırın veya azaltın.  
 .
 :SHELL_STARTUP_DOSV
@@ -1907,7 +1910,7 @@ DOSBox-X komut yardımını gösterir.
 HELP [/A or /ALL]
 HELP [komut]
 
-   /A veya /ALL   Desteklenen tüm dahili komutları listeler.
+   /A veya /ALL   Desteklenen tüm içsel komutları listeler.
    [komut]        Belirli bir komut için yardımı gösterir.
 
 ←[0mÖrn., ←[37;1mHELP COPY←[0m veya ←[37;1mCOPY /?←[0m COPY komutu için yardımı gösterir.
@@ -2130,7 +2133,7 @@ toplu-iş-ayarları  Toplu iş dosyası tarafından gerektirilen herhangi bir ko
 
 .
 :SHELL_CMD_SUBST_HELP
-Bir sürücüye bir dahili dizin atar.
+Bir sürücüye bir içsel dizin atar.
 
 .
 :SHELL_CMD_SUBST_HELP_LONG
@@ -2178,17 +2181,17 @@ ATTRIB [+R | -R] [+A | -A] [+S | -S] [+H | -H] [sürücü:][yol][dosya-adı] [/S
 
   +   Bir öznitelik ayarlar.
   -   Bir özniteliği temizler.
-  R   Saltokunur dosya özniteliği.
-  A   Arşiv dosyası özniteliği.
-  S   Sistem dosyası özniteliği.
-  H   Gizli dosya özniteliği.
+  R   Saltokunur dosya özniteliği
+  A   Arşiv dosyası özniteliği
+  S   Sistem dosyası özniteliği
+  H   Gizli dosya özniteliği
   [sürücü:][yol][dosya-ado]
       ATTRIB'in işlemesi için dosyaları veya dizini belirtir.
   /S  Belirtilen yoldaki tüm dizinlerdeki dosyaları işler.
 
 .
 :SHELL_CMD_PATH_HELP
-Çalıştırılabilir dosyalar için bir yol ayarlar veya görüntüler.
+Yürütülebilir dosyalar için bir yol ayarlar veya görüntüler.
 
 .
 :SHELL_CMD_PATH_HELP_LONG
@@ -2369,7 +2372,7 @@ CTTY aygıt
 
 .
 :SHELL_CMD_MORE_HELP
-Bir kezde tek ekranlık çıktı görüntüler.
+Tek kerede bir ekranlık çıktı görüntüler.
 
 .
 :SHELL_CMD_MORE_HELP_LONG
@@ -2434,7 +2437,7 @@ Hızlı program başlat...
 DOSBox-X'ten çık
 .
 :MENU:mapper_capkeyboard
-Capture keyboard
+Klavyeyi yakala
 .
 :MENU:mapper_capmouse
 Fareyi yakala
@@ -2467,7 +2470,7 @@ Yarıda kesmeler etkinken durdur
 Yapılandırma aracı
 .
 :MENU:mapper_mapper
-Eşlem düzenleyici
+Eşlem düzenleyicisi
 .
 :MENU:mapper_fullscr
 Tam ekrana gir/çık
@@ -2632,7 +2635,7 @@ Kapalı
 10 kare
 .
 :MENU:VideoRatioMenu
-en-boy oranı
+En-boy oranı
 .
 :MENU:video_ratio_1_1
 1:1
@@ -3064,10 +3067,10 @@ Uzun dosya adı öykünmesini devre dışı bırak
 PC-98 PIT ana saat
 .
 :MENU:dos_pc98_pit_4mhz
-4MHz/8MHz PIT ana saat
+4 MHz/8 MHz PIT ana saat
 .
 :MENU:dos_pc98_pit_5mhz
-5MHz/10MHz PIT ana saat
+5 MHz/10 MHz PIT ana saat
 .
 :MENU:DOSEMSMenu
 Genişletilmiş bellek (EMS)
@@ -4546,3 +4549,17 @@ Ekran görüntüsü dosyaya kaydedildi:
 
 %s
 .
+:HELP_ABOUT_VERSION
+DOSBox-X sürüm %s (%s %s %s bit)%s
+.
+:HELP_ABOUT_UPDATED
+Yapım zamanı: %s
+.
+:HELP_ABOUT_COPYRIGHT
+Telif hakkı %s-%s %s
+.
+:HELP_ABOUT_MAINTAINER
+Proje bakımcısı: %s
+.
+:HELP_ABOUT_HOMEPAGE
+DOSBox-X ana sayfası: %s

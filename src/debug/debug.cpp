@@ -153,6 +153,7 @@ extern bool logBuffSuppressConsole;
 extern bool logBuffSuppressConsoleNeedUpdate;
 
 void DEBUG_PrintGUS();
+void DEBUG_PrintRTC();
 
 // Forwards
 static void DrawCode(void);
@@ -160,12 +161,15 @@ static void DrawInput(void);
 static void DEBUG_RaiseTimerIrq(void);
 static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num);
 static void SaveMemoryBin(uint16_t seg, uint32_t ofs1, uint32_t num);
+static void LogDEVS(void);
 static void LogMCBS(void);
 static void LogGDT(void);
 static void LogLDT(void);
 static void LogIDT(void);
 static void LogXMS(void);
+#if !defined(OSFREE)
 static void LogEMS(void);
+#endif
 static void LogFNKEY(void);
 static void LogPages(char* selname);
 static void LogCPUInfo(void);
@@ -211,6 +215,8 @@ static void LogEMUMachine(void) {
         switch (machine) {
             case MCH_HERC:      m="Hercules";   break;
             case MCH_CGA:       m="CGA";        break;
+            case MCH_OLIVETTI:  m="Olivetti M24"; break;
+            case MCH_3270PC:    m="IBM 3270 PC"; break;
             case MCH_TANDY:     m="Tandy";      break;
             case MCH_PCJR:      m="PCjr";       break;
             case MCH_EGA:       m="EGA";        break;
@@ -299,6 +305,7 @@ typedef struct MEMFinder {
 	uint16_t iterations = 0;
 	uint16_t seg = 0;
 	uint32_t ofs = 0;
+	uint32_t baseLinear = 0;
 	uint32_t range = 0;
 	uint32_t value = 0;
 	uint32_t matches = 0;
@@ -447,12 +454,37 @@ uint64_t LinMakeProt(uint16_t selector, uint32_t offset)
 	return mem_no_address;
 }
 
+static bool Is16BitSegment(const uint16_t seg)
+{
+	if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+		if (seg == SegValue(cs))
+			return !cpu.code.big;
+
+		Descriptor desc;
+		return cpu.gdt.GetDescriptor(seg, desc) ? !desc.saved.seg.big : false;
+	}
+
+	return true;
+}
+
 uint64_t GetAddress(uint16_t seg, uint32_t offset)
 {
+	/* In 16-bit modes, segment offsets wrap to 16 bits. This also normalizes
+	 * values that came from signed arithmetic (for example, -1 -> 0xFFFF). */
+	if (Is16BitSegment(seg))
+		offset &= 0xffffu;
+
+	/* For the current CS, always use the cached hidden base (SegPhys(cs)).
+	 * Real x86 segment registers have a hidden descriptor cache that is only
+	 * updated when a new selector is loaded. After LMSW sets CR0.PE=1 but
+	 * before a far jump reloads CS, cpu.pmode is true yet SegValue(cs) still
+	 * holds the previous (real-mode) value, so resolving via the GDT would
+	 * read garbage. */
+	if (seg == SegValue(cs)) return SegPhys(cs)+(uint64_t)offset;
+
 	if (cpu.pmode && !(reg_flags & FLAG_VM))
 		return LinMakeProt(seg,offset);
 
-	if (seg==SegValue(cs)) return SegPhys(cs)+(uint64_t)offset;
 	return ((uint64_t)seg<<4u)+offset;
 }
 
@@ -534,6 +566,7 @@ private:
 public:
 	static void       InsertVariable(char* name, PhysPt adr);
 	static CDebugVar* FindVar       (PhysPt pt);
+	static CDebugVar* FindVar       (const std::string& name);
 	static void       DeleteAll     ();
 	static bool       SaveVars      (char* name);
 	static bool       LoadVars      (char* name);
@@ -542,6 +575,45 @@ public:
 };
 
 std::vector<CDebugVar*> CDebugVar::varList;
+
+static void AnnotateDirectBranch(char* line, const size_t line_size)
+{
+	char* mnemonic = line;
+	while (*mnemonic == ' ' || *mnemonic == '\t') ++mnemonic;
+
+	char* operand = mnemonic;
+	while (isalpha(static_cast<unsigned char>(*operand))) ++operand;
+	const std::string instruction(mnemonic, operand - mnemonic);
+	if (instruction != "call" && instruction != "jmp" &&
+	    (instruction.empty() || instruction[0] != 'j') &&
+	    instruction.compare(0, 4, "loop") != 0)
+		return;
+
+	while (*operand == ' ' || *operand == '\t') ++operand;
+	for (const char* qualifier : {"far ", "near ", "short "}) {
+		const size_t length = strlen(qualifier);
+		if (strncmp(operand, qualifier, length) == 0) {
+			operand += length;
+			break;
+		}
+	}
+
+	char* end = operand;
+	while (isxdigit(static_cast<unsigned char>(*end))) ++end;
+	if (end == operand || (*end != '\0' && *end != ' ' && *end != '\t')) return;
+
+	char* parse_end = nullptr;
+	const unsigned long target = strtoul(operand, &parse_end, 16);
+	if (parse_end != end || target > UINT32_MAX) return;
+
+	CDebugVar* variable = CDebugVar::FindVar(static_cast<PhysPt>(target));
+	if (!variable) return;
+
+	const size_t used = strlen(line);
+	const size_t available = used < line_size ? line_size - used : 0;
+	if (available > 1)
+		snprintf(line + used, available, " <%s>", variable->GetName());
+}
 
 
 /********************/
@@ -1372,6 +1444,7 @@ static void DrawCode(void) {
             drawsize=size=1;
             dline[0]=0;
         }
+		AnnotateDirectBranch(dline, sizeof(dline));
 		mvwprintw(dbg.win_code,i,0,"%04X:%08X ",codeViewData.useCS,disEIP);
 
 		if (drawsize>10) { toolarge = true; drawsize = 9; }
@@ -1646,6 +1719,7 @@ uint32_t GetHexValue(char* const str, char* &hex,bool *parsed,int exprge)
             else if (something == "DTASEG") { regval = (!dos_kernel_disabled) ? (dos.dta() >> 16u)    : 0; }
             else if (something == "DTAOFF") { regval = (!dos_kernel_disabled) ? (dos.dta() & 0xFFFFu) : 0; }
             else if (something == "PSPSEG") { regval = (!dos_kernel_disabled) ?  dos.psp()            : 0; }
+            else if (CDebugVar* variable = CDebugVar::FindVar(something)) { regval = variable->GetAdr(); }
             else if (hexnumber) { regval = (uint32_t)strtoul(something.c_str(),NULL,16/*hexadecimal*/); }
             else { if (parsed) *parsed = 0; return 0; }
         }
@@ -1912,6 +1986,11 @@ bool lookslikefloat(char* str) {
     return true;
 }
 
+void AddBPINT3(void) {
+	CBreakpoint::AddIntBreakpoint(3,BPINT_ALL,BPINT_ALL,false);
+	CBreakpoint::ActivateBreakpoints();
+}
+
 void VGA_DumpFontRamBIN(const char *filename);
 void VGA_DumpFontRamBMP(const char *filename);
 int32_t DEBUG_Run(int32_t amount,bool quickexit);
@@ -2033,7 +2112,7 @@ bool ParseCommand(char* str) {
 			if (MEMFINDInstance != NULL){
 				DEBUG_BeginPagedContent();
 				uint32_t j = 0;
-				for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i+=MEMFINDInstance->size){
+				for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i+=MEMFINDInstance->size){
 							switch (MEMFINDInstance->size){
 								case 1:
 									mem_readb_checked((PhysPt)(i),&valfind8);
@@ -2054,7 +2133,7 @@ bool ParseCommand(char* str) {
 							}
 							if (MEMFINDInstance->tableTruth[j] == true){
 								listedvalues++;
-								DEBUG_ShowMsg("DEBUG: [MEMFIND] Address: %04X:%06X Current Value: %08X\n",MEMFINDInstance->seg,(i - (MEMFINDInstance->seg * 16)),valfind);
+								DEBUG_ShowMsg("DEBUG: [MEMFIND] Address: %04X:%06X (lin %08X) Current Value: %0*X\n",MEMFINDInstance->seg,(MEMFINDInstance->ofs + (i - MEMFINDInstance->baseLinear)),i,MEMFINDInstance->size*2,valfind);
 							}
 							j+=MEMFINDInstance->size;
 						}
@@ -2069,12 +2148,19 @@ bool ParseCommand(char* str) {
 		uint32_t ofs = GetHexValue(found,found); found++;
 		uint32_t num = GetHexValue(found,found); found++;
 		if ((MEMFINDInstance == NULL) && (num > 0)){
-			if (((seg*16)+ofs+num) > 16777215){
-				DEBUG_ShowMsg("DEBUG: Address range larger than valid size, cancelling.");
+			uint64_t base = GetAddress(seg,ofs);
+			if (base == mem_no_address){
+				DEBUG_ShowMsg("DEBUG: Invalid selector/segment, cancelling.");
+				return true;
+			}
+			uint64_t memBytes = (uint64_t)MEM_TotalPages() << 12;
+			if ((base + (uint64_t)num) > memBytes){
+				DEBUG_ShowMsg("DEBUG: Range exceeds configured memory (%lX bytes), cancelling.",(unsigned long)memBytes);
 				return true;
 			}
 			DEBUG_ShowMsg("DEBUG: Created memory search instance.");
 			MEMFINDInstance = new MEMFinder;
+			MEMFINDInstance->baseLinear = (uint32_t)base;
 		} else if ((MEMFINDInstance == NULL) && (num == 0)){
 			DEBUG_ShowMsg("DEBUG: --MEMFIND-- Start memory search instance.");
 			DEBUG_ShowMsg("DEBUG: Use MEMS to proceed through search instance.");
@@ -2104,12 +2190,12 @@ bool ParseCommand(char* str) {
 				MEMFINDInstance->size = 1;
 				break;
 		}
-		DEBUG_ShowMsg("DEBUG: RAM search from %04X:%04X with range: %06X\n",seg,ofs,num);
+		DEBUG_ShowMsg("DEBUG: RAM search from %04X:%04X (lin %08X) with range: %06X\n",seg,ofs,MEMFINDInstance->baseLinear,num);
 		MEMFINDInstance->range = num;
 		MEMFINDInstance->ofs = ofs;
 		MEMFINDInstance->seg = seg;
 		MEMFINDInstance->tableTruth.resize(num,true);
-		for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i++){
+		for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i++){
 			mem_readb_checked((PhysPt)(i),&valfind8);
 			MEMFINDInstance->tableValue.push_back(valfind8);
 		}
@@ -2186,7 +2272,7 @@ bool ParseCommand(char* str) {
 			MEMFINDInstance->usePreviousValue = false;
 		}
 		uint32_t y = 0;	//This index is seperated from the for loop, as the for loop can start from any index while this particular index starts at 0
-		for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i+=MEMFINDInstance->size){
+		for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i+=MEMFINDInstance->size){
 			switch (MEMFINDInstance->size){
 				case 1:
 					mem_readb_checked((PhysPt)(i),&valfind8);
@@ -2269,7 +2355,7 @@ bool ParseCommand(char* str) {
 			if (MEMFINDInstance->usePreviousValue == true){
 				DEBUG_ShowMsg("DEBUG: No more matches found when comparing %s previous value. Memory search instance finished.\n",opTypeStr);
 			} else {
-				DEBUG_ShowMsg("DEBUG: No more matches found with value %s (%06X). Memory search instance finished.\n",opTypeStr,value);
+				DEBUG_ShowMsg("DEBUG: No more matches found with value %s (%0*X). Memory search instance finished.\n",opTypeStr,MEMFINDInstance->size*2,value);
 			}
 			MEMFINDInstance->tableTruth.clear();
 			MEMFINDInstance->tableValue.clear();
@@ -2281,7 +2367,7 @@ bool ParseCommand(char* str) {
 				if (MEMFINDInstance->usePreviousValue == true){
 					DEBUG_ShowMsg("DEBUG: (%06X) addresses matching %s their previous values. Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,MEMFINDInstance->iterations);
 				} else {
-					DEBUG_ShowMsg("DEBUG: (%06X) matches found with value %s (%06X). Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,value,MEMFINDInstance->iterations);
+					DEBUG_ShowMsg("DEBUG: (%06X) matches found with value %s (%0*X). Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,MEMFINDInstance->size*2,value,MEMFINDInstance->iterations);
 				}
 		}
 		return true;
@@ -2847,11 +2933,14 @@ bool ParseCommand(char* str) {
 	if (command == "DOS") {
 		stream >> command;
 		if (command == "MCBS") LogMCBS();
-        else if (command == "KERN") LogDOSKernMem();
-        else if (command == "XMS") LogXMS();
-        else if (command == "EMS") LogEMS();
-        else if (command == "FNKEY") LogFNKEY();
-        else return false;
+		else if (command == "DEVS") LogDEVS();
+		else if (command == "KERN") LogDOSKernMem();
+		else if (command == "XMS") LogXMS();
+#if !defined(OSFREE)
+		else if (command == "EMS") LogEMS();
+#endif
+		else if (command == "FNKEY") LogFNKEY();
+		else return false;
 
 		return true;
 	}
@@ -3228,8 +3317,22 @@ bool ParseCommand(char* str) {
         return true;
     }
 
+    if (command == "RTC") {
+        while (*found == ' ') found++;
+        command.clear(); // iostream >> command does not update "command" if there is no string there, so it's basically fancy scanf() then!
+        stream >> command;
+        while (*found != 0 && *found != ' ') found++;
+        while (*found == ' ') found++;
+
+        if (command == "") {
+            DEBUG_PrintRTC();
+            return true;
+        }
+    }
+
     if (command == "VGA") {
         while (*found == ' ') found++;
+        command.clear(); // iostream >> command does not update "command" if there is no string there, so it's basically fancy scanf() then!
         stream >> command;
         while (*found != 0 && *found != ' ') found++;
         while (*found == ' ') found++;
@@ -4099,30 +4202,53 @@ char* AnalyzeInstruction(char* inst, bool saveSelector) {
 			} else
 				pos++;
 		}
-		uint32_t address = (uint32_t)GetAddress(seg,adr);
-		if (!(get_tlb_readhandler(address)->flags & PFLAG_INIT)) {
-			static char outmask[] = "%s:[%04X]=%02X";
-
-			if (cpu.pmode) outmask[6] = '8';
-				switch (DasmLastOperandSize()) {
-				case 8 : {	uint8_t val = mem_readb(address);
-							outmask[12] = '2';
-							sprintf(result,outmask,prefix,adr,val);
-						}	break;
-				case 16: {	uint16_t val = mem_readw(address);
-							outmask[12] = '4';
-							sprintf(result,outmask,prefix,adr,val);
-						}	break;
-				case 32: {	uint32_t val = mem_readd(address);
-							outmask[12] = '8';
-							sprintf(result,outmask,prefix,adr,val);
-						}	break;
-			}
-		} else {
+		if (Is16BitSegment(seg))
+			adr &= 0xffffu;
+		const uint64_t address64 = GetAddress(seg,adr);
+		const uint32_t address = (uint32_t)address64;
+		if (address64 == mem_no_address) {
 			sprintf(result,"[illegal]");
 		}
+		else {
+			static char outmask[] = "%s:[%04X]=%02X";
+			bool illegal = false;
+
+			if (cpu.pmode) outmask[6] = '8';
+			switch (DasmLastOperandSize()) {
+			case 8: {
+				uint8_t val = 0;
+				illegal = mem_readb_checked(address,&val);
+				if (!illegal) {
+					outmask[12] = '2';
+					sprintf(result,outmask,prefix,adr,val);
+				}
+			} break;
+			case 16: {
+				uint16_t val = 0;
+				illegal = mem_readw_checked(address,&val);
+				if (!illegal) {
+					outmask[12] = '4';
+					sprintf(result,outmask,prefix,adr,val);
+				}
+			} break;
+			case 32: {
+				uint32_t val = 0;
+				illegal = mem_readd_checked(address,&val);
+				if (!illegal) {
+					outmask[12] = '8';
+					sprintf(result,outmask,prefix,adr,val);
+				}
+			} break;
+			default:
+				illegal = true;
+				break;
+			}
+
+			if (illegal)
+				sprintf(result,"[illegal]");
+		}
 		// Variable found ?
-		CDebugVar* var = CDebugVar::FindVar(address);
+		CDebugVar* var = (address64 != mem_no_address) ? CDebugVar::FindVar(address) : NULL;
 		if (var) {
 			// Replace occurrence
 			char* pos1 = strchr(inst,'[');
@@ -4317,6 +4443,87 @@ int32_t DEBUG_Run(int32_t amount,bool quickexit) {
 	}
 	return ret;
 }
+
+#ifdef WIN32
+/* Translate VT escape sequences into ncurses KEY_* constants. Needed because
+   we set ENABLE_VIRTUAL_TERMINAL_INPUT on the debugger console input handle
+   (so the terminal host stops swallowing F11 etc. for fullscreen). With that
+   flag, function keys arrive as VT sequences (e.g. F11 = ESC [ 23 ~) instead of
+   virtual key codes, so ncurses' getch() returns them char by char and the
+   KEY_F(N) cases below never fire. */
+static int dbg_getch_vt(void) {
+	int c = getch();
+	if (c != 27) return c;
+
+	int c2 = getch();
+	if (c2 < 0) return 27; /* plain ESC */
+
+	if (c2 == 'O') {
+		/* SS3: ESC O X */
+		int c3 = getch();
+		switch (c3) {
+			case 'P': return KEY_F(1);
+			case 'Q': return KEY_F(2);
+			case 'R': return KEY_F(3);
+			case 'S': return KEY_F(4);
+			case 'A': return KEY_UP;
+			case 'B': return KEY_DOWN;
+			case 'C': return KEY_RIGHT;
+			case 'D': return KEY_LEFT;
+			case 'H': return KEY_HOME;
+			case 'F': return KEY_END;
+		}
+		return 27;
+	}
+
+	if (c2 == '[') {
+		/* CSI: ESC [ [params] final */
+		int param = 0;
+		int c3 = getch();
+		while (c3 >= '0' && c3 <= '9') {
+			param = param * 10 + (c3 - '0');
+			c3 = getch();
+		}
+		if (c3 == '~') {
+			switch (param) {
+				case 1: return KEY_HOME;
+				case 2: return KEY_IC;
+				case 3: return KEY_DC;
+				case 4: return KEY_END;
+				case 5: return KEY_PPAGE;
+				case 6: return KEY_NPAGE;
+				case 11: return KEY_F(1);
+				case 12: return KEY_F(2);
+				case 13: return KEY_F(3);
+				case 14: return KEY_F(4);
+				case 15: return KEY_F(5);
+				case 17: return KEY_F(6);
+				case 18: return KEY_F(7);
+				case 19: return KEY_F(8);
+				case 20: return KEY_F(9);
+				case 21: return KEY_F(10);
+				case 23: return KEY_F(11);
+				case 24: return KEY_F(12);
+			}
+		} else if (param == 0) {
+			switch (c3) {
+				case 'A': return KEY_UP;
+				case 'B': return KEY_DOWN;
+				case 'C': return KEY_RIGHT;
+				case 'D': return KEY_LEFT;
+				case 'H': return KEY_HOME;
+				case 'F': return KEY_END;
+			}
+		}
+		return 27;
+	}
+
+	/* Alt+letter or other ESC-prefixed sequence — push back so the existing
+	   case 27 handler below can read it as before. */
+	ungetch(c2);
+	return 27;
+}
+#endif
 
 uint32_t DEBUG_CheckKeys(int key) {
 	Bits ret=0;
@@ -4833,7 +5040,11 @@ Bitu DEBUG_Loop(void) {
             DEBUG_RefreshPage(0);
         }
 
+#ifdef WIN32
+    	return DEBUG_CheckKeys(dbg_getch_vt());
+#else
     	return DEBUG_CheckKeys(getch());
+#endif
     }
 }
 
@@ -4989,23 +5200,43 @@ static void DEBUG_RaiseTimerIrq(void) {
 	PIC_ActivateIRQ(0);
 }
 
+static void LogDEVChain(uint32_t devhdr) {
+	DOS_DEVHDR::hdr hdr;
+	char tmp[9];
+
+	while (1) {
+		MEM_BlockRead(PhysMake(devhdr >> 16,devhdr & 0xFFFFu),&hdr,sizeof(hdr));
+		memcpy(tmp,hdr.name,8); tmp[8] = 0;
+		DEBUG_ShowMsg("%04X:%04X %04X  %04X  %04X  %s",
+			devhdr >> 16,devhdr & 0xFFFFu,
+			hdr.attributes,hdr.strategy_entry,hdr.interrupt_entry,tmp);
+
+		devhdr = hdr.nextdev;
+		if (devhdr == NONEXTDEV) break;
+
+		/* Apparently in MS-DOS 5, a driver can set only the offset field to 0xFFFF and that is sufficient to end the linked list */
+		if ((devhdr&0xFFFFu) == 0xFFFFu) break;
+	}
+}
+
 // Display the content of the MCB chain starting with the MCB at the specified segment.
 static void LogMCBChain(uint16_t mcb_segment) {
-	DOS_MCB mcb(mcb_segment);
-	char filename[9]; // 8 characters plus a terminating NUL
+	std::string filename;
 	const char *psp_seg_note;
 	uint16_t DOS_dataOfs = static_cast<uint16_t>(dataOfs); //Realmode addressing only
 	PhysPt dataAddr = PhysMake(dataSeg,DOS_dataOfs);// location being viewed in the "Data Overview"
+	uint16_t end_of_chain_segment = mcb_segment;
 
-	// loop forever, breaking out of the loop once we've processed the last MCB
-	while (true) {
+	for (const auto mcb : DOS_MCB(mcb_segment)) {
+		const auto current_segment = mcb.GetSeg();
+
 		// verify that the type field is valid
-		if (mcb.GetType()!=0x4d && mcb.GetType()!=0x5a) {
-			DEBUG_ShowMsg("MCB chain broken at %04X:0000!",mcb_segment);
+		if (!mcb.isValid()) {
+			DEBUG_ShowMsg("MCB chain broken at %04X:0000!",current_segment);
 			return;
 		}
 
-		mcb.GetFileName(filename);
+		filename = mcb.GetFileName();
 
 		// some PSP segment values have special meanings
 		switch (mcb.GetPSPSeg()) {
@@ -5019,25 +5250,18 @@ static void LogMCBChain(uint16_t mcb_segment) {
 				psp_seg_note = "";
 		}
 
-		DEBUG_ShowMsg("   %04X  %12u     %04X %-7s  %s",mcb_segment,mcb.GetSize() << 4,mcb.GetPSPSeg(), psp_seg_note, filename);
+		DEBUG_ShowMsg("   %04X  %12u     %04X %-7s  %s",current_segment,mcb.GetSize() << 4,mcb.GetPSPSeg(), psp_seg_note, filename.c_str());
 
 		// print a message if dataAddr is within this MCB's memory range
-		PhysPt mcbStartAddr = PhysMake(mcb_segment+1,0);
-		PhysPt mcbEndAddr = PhysMake(mcb_segment+1+mcb.GetSize(),0);
+		PhysPt mcbStartAddr = PhysMake(current_segment+1,0);
+		PhysPt mcbEndAddr = PhysMake(current_segment+1+mcb.GetSize(),0);
 		if (dataAddr >= mcbStartAddr && dataAddr < mcbEndAddr) {
 			DEBUG_ShowMsg("   (data addr %04hX:%04X is %u bytes past this MCB)",dataSeg,DOS_dataOfs,dataAddr - mcbStartAddr);
 		}
-
-		// if we've just processed the last MCB in the chain, break out of the loop
-		mcb_segment+=mcb.GetSize()+1;
-		if (mcb.GetType()==0x5a)
-			break;
-
-		// else, move to the next MCB in the chain
-		mcb.SetPt(mcb_segment);
+		end_of_chain_segment = static_cast<uint16_t>(current_segment + mcb.GetSize() + 1);
 	}
 
-	DEBUG_ShowMsg("   %04X  END OF CHAIN",mcb_segment);
+	DEBUG_ShowMsg("   %04X  END OF CHAIN",end_of_chain_segment);
 }
 
 #include "regionalloctracking.h"
@@ -5067,10 +5291,12 @@ static void LogBIOSMem(void) {
 Bitu XMS_GetTotalHandles(void);
 bool XMS_GetHandleInfo(Bitu &phys_location,Bitu &size,Bitu &lockcount,bool &free,Bitu handle);
 
+#if !defined(OSFREE)
 bool EMS_GetHandle(Bitu &size,PhysPt &addr,std::string &name,Bitu handle);
 const char *EMS_Type_String(void);
 Bitu EMS_Max_Handles(void);
 bool EMS_Active(void);
+#endif
 
 static void LogFNKEY(void) {
     DEBUG_BeginPagedContent();
@@ -5081,6 +5307,7 @@ static void LogFNKEY(void) {
     DEBUG_EndPagedContent();
 }
 
+#if !defined(OSFREE)
 static void LogEMS(void) {
     Bitu h_size;
     PhysPt xh_addr;
@@ -5151,6 +5378,7 @@ static void LogEMS(void) {
 
     DEBUG_EndPagedContent();
 }
+#endif
 
 static void LogXMS(void) {
     Bitu phys_location;
@@ -5208,6 +5436,43 @@ static void LogDOSKernMem(void) {
     }
 
     DEBUG_EndPagedContent();
+}
+
+// Display the content of all device drivers.
+static void LogDEVS(void) {
+	if (dos_kernel_disabled) {
+		if (boothax == BOOTHAX_MSDOS) {
+			if (guest_msdos_LoL == 0 || guest_msdos_dev_chain == 0) {
+				DEBUG_ShowMsg("Cannot enumerate device list while DOS kernel is inactive, and DOSBox-X has not yet determined the DEV list of the guest MS-DOS operating system");
+				return;
+			}
+
+			DEBUG_BeginPagedContent();
+
+			try {
+				DEBUG_ShowMsg("Header    Attr  Strat Intr  Name");
+				LogDEVChain(guest_msdos_dev_chain);
+			}
+			catch (GuestPageFaultException &pf) {
+				(void)pf;//unused
+				DEBUG_ShowMsg("(Enumeration caused page fault within the guest)");
+			}
+
+			DEBUG_EndPagedContent();
+			return;
+		}
+		else {
+			DEBUG_ShowMsg("Cannot enumerate device list while DOS kernel is inactive.");
+			return;
+		}
+	}
+
+	DEBUG_BeginPagedContent();
+
+	DEBUG_ShowMsg("Header    Attr  Strat Intr  Name");
+	LogDEVChain(dos_infoblock.GetStartOfDeviceChain());
+
+	DEBUG_EndPagedContent();
 }
 
 // Display the content of all Memory Control Blocks.
@@ -5462,20 +5727,20 @@ static void LogInstruction(uint16_t segValue, uint32_t eipValue,  ofstream& out)
 	char dline[200];Bitu size;
 	size = DasmI386(dline, start, reg_eip, cpu.code.big);
 	char* res = empty;
-	if (showExtend && (cpuLogType > 0) ) {
+	if (showExtend && (cpuLogType > 0)) {
 		res = AnalyzeInstruction(dline,false);
 		if (!res || !(*res)) res = empty;
 		Bitu reslen = strlen(res);
-        if (reslen < 22) {
-            memset(res + reslen, ' ', 22 - reslen);
-            res[22] = 0;
-        }
+		if (reslen < 22) {
+			memset(res + reslen, ' ', 22 - reslen);
+			res[22] = 0;
+		}
 	}
 	Bitu len = strlen(dline);
-    if (len < 30) {
-        memset(dline + len, ' ', 30 - len);
-        dline[30] = 0;
-    }
+	if (len < 30) {
+		memset(dline + len, ' ', 30 - len);
+		dline[30] = 0;
+	}
 
 	// Get register values
 
@@ -5484,7 +5749,9 @@ static void LogInstruction(uint16_t segValue, uint32_t eipValue,  ofstream& out)
 	} else if (cpuLogType == 1) {
 		out << setw(4) << SegValue(cs) << ":" << setw(8) << reg_eip << "  " << dline << "  " << res;
 	} else if (cpuLogType == 2) {
-		char ibytes[200]="";	char tmpc[200];
+		char ibytes[200]="";
+		char tstamp[128];
+		char tmpc[200];
 		for (Bitu i=0; i<size; i++) {
 			uint8_t value;
 			if (mem_readb_checked((PhysPt)(start+i),&value)) sprintf(tmpc,"%s","?? ");
@@ -5492,32 +5759,33 @@ static void LogInstruction(uint16_t segValue, uint32_t eipValue,  ofstream& out)
 			strcat(ibytes,tmpc);
 		}
 		len = strlen(ibytes);
-        if (len < 21) {
-            for (Bitu i = 0; i < 21 - len; i++) ibytes[len + i] = ' ';
-            ibytes[21] = 0;
-        }
-		out << setw(4) << SegValue(cs) << ":" << setw(8) << reg_eip << "  " << dline << "  " << res << "  " << ibytes;
+		if (len < 21) {
+			for (Bitu i = 0; i < 21 - len; i++) ibytes[len + i] = ' ';
+			ibytes[21] = 0;
+		}
+		sprintf(tstamp,"%.6f",(double)PIC_FullIndex());
+		out << tstamp << " " << setw(4) << SegValue(cs) << ":" << setw(8) << reg_eip << "  " << dline << "  " << res << "  " << ibytes;
 	}
 
 	out << " EAX:" << setw(8) << reg_eax << " EBX:" << setw(8) << reg_ebx
-	    << " ECX:" << setw(8) << reg_ecx << " EDX:" << setw(8) << reg_edx
-	    << " ESI:" << setw(8) << reg_esi << " EDI:" << setw(8) << reg_edi
-	    << " EBP:" << setw(8) << reg_ebp << " ESP:" << setw(8) << reg_esp
-	    << " DS:"  << setw(4) << SegValue(ds)<< " ES:"  << setw(4) << SegValue(es);
+		<< " ECX:" << setw(8) << reg_ecx << " EDX:" << setw(8) << reg_edx
+		<< " ESI:" << setw(8) << reg_esi << " EDI:" << setw(8) << reg_edi
+		<< " EBP:" << setw(8) << reg_ebp << " ESP:" << setw(8) << reg_esp
+		<< " DS:"  << setw(4) << SegValue(ds)<< " ES:"  << setw(4) << SegValue(es);
 
 	if(cpuLogType == 0) {
 		out << " SS:"  << setw(4) << SegValue(ss) << " C"  << (get_CF()>0)  << " Z"   << (get_ZF()>0)
-		    << " S" << (get_SF()>0) << " O"  << (get_OF()>0) << " I"  << GETFLAGBOOL(IF);
+			<< " S" << (get_SF()>0) << " O"  << (get_OF()>0) << " I"  << GETFLAGBOOL(IF);
 	} else {
 		out << " FS:"  << setw(4) << SegValue(fs) << " GS:"  << setw(4) << SegValue(gs)
-		    << " SS:"  << setw(4) << SegValue(ss)
-		    << " CF:"  << (get_CF()>0)  << " ZF:"   << (get_ZF()>0)  << " SF:"  << (get_SF()>0)
-		    << " OF:"  << (get_OF()>0)  << " AF:"   << (get_AF()>0)  << " PF:"  << (get_PF()>0)
-		    << " IF:"  << GETFLAGBOOL(IF);
+			<< " SS:"  << setw(4) << SegValue(ss)
+			<< " CF:"  << (get_CF()>0)  << " ZF:"   << (get_ZF()>0)  << " SF:"  << (get_SF()>0)
+			<< " OF:"  << (get_OF()>0)  << " AF:"   << (get_AF()>0)  << " PF:"  << (get_PF()>0)
+			<< " IF:"  << GETFLAGBOOL(IF);
 	}
 	if(cpuLogType == 2) {
 		out << " TF:" << GETFLAGBOOL(TF) << " VM:" << GETFLAGBOOL(VM) <<" FLG:" << setw(8) << reg_flags
-		    << " CR0:" << setw(8) << cpu.cr0;
+			<< " CR0:" << setw(8) << cpu.cr0;
 	}
 	out << endl;
 }
@@ -5579,19 +5847,22 @@ private:
 };
 #endif
 
-#if C_DEBUG
+#if !defined(OSFREE)
+# if C_DEBUG
 extern bool debugger_break_on_exec;
+# endif
 #endif
 
 void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off)
 {
-#if C_DEBUG
+#if !defined(OSFREE)
+# if C_DEBUG
     if (debugger_break_on_exec) {
 		CBreakpoint::AddBreakpoint(seg,off,true);
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
         debugger_break_on_exec = false;
     }
-#if C_REMOTEDEBUG
+#  if C_REMOTEDEBUG
     // GDB-aware break on exec (from QMP debug-execute)
     if (gdb_break_on_exec) {
         LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: GDB break on exec at %04X:%08X", seg, off);
@@ -5599,7 +5870,8 @@ void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off)
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
         // Note: gdb_break_on_exec is cleared when breakpoint is hit
     }
-#endif
+#  endif
+# endif
 #endif
 #if 0
 	if (pDebugcom && pDebugcom->IsActive()) {
@@ -5756,6 +6028,14 @@ CDebugVar* CDebugVar::FindVar(PhysPt pt)
 	for(std::vector<CDebugVar*>::size_type i = 0; i != s; i++) {
 		CDebugVar* bp = varList[i];
 		if (bp->GetAdr() == pt) return bp;
+	}
+	return nullptr;
+}
+
+CDebugVar* CDebugVar::FindVar(const std::string& name)
+{
+	for (auto* variable : varList) {
+		if (strcasecmp(name.c_str(), variable->GetName()) == 0) return variable;
 	}
 	return nullptr;
 }
@@ -6268,30 +6548,56 @@ uint32_t DEBUG_GetRegister(int reg) {
 #endif
 
  /* The GDB remote serial protocol's Z0/z0 address is LINEAR, the same as the
-  * m and M packets. Segment zero makes GetAddress(0, off) == off in real
-  * mode (see GetAddress above), so the stored breakpoint location is exactly
-  * the linear address, and CheckBreakpoint compares it against the true
-  * physical PC, GetAddress(SegValue(cs), reg_eip).
+  * m and M packets. CBreakpoint, however, stores a segment:offset pair and
+  * resolves it with GetAddress(seg, off), and GetAddress() masks the offset
+  * to 16 bits whenever the segment is a 16-bit one -- which in real mode is
+  * always. So a linear address cannot be handed over as (0, address):
+  * 0x30000 would be truncated to 0x0000 and the breakpoint would answer OK
+  * and fire at the wrong place, or never.
+  *
+  * Split it instead, so the offset always fits in 16 bits and
+  * GetAddress(seg, off) reproduces the linear address exactly. Below 1 MB
+  * that is (address >> 4, address & 0xF); the HMA (0x100000..0x10FFEF, live
+  * whenever A20 is on) does not fit that form because the segment field is
+  * only 16 bits, so it is expressed against segment 0xFFFF with an offset up
+  * to 0xFFEF.
   *
   * This used to split the argument as a far pointer with FP_SEG(x) = x >> 16.
   * Any breakpoint above 0x10000 answered OK and never fired; below 0x10000
   * the two interpretations coincide, which is why it looked like it worked.
   *
-  * In protected mode (cpu.pmode && !(reg_flags & FLAG_VM)) GetAddress(0, off)
-  * routes through LinMakeProt(0, off), which rejects selector 0 (selectors
-  * below 8 are never valid) and returns mem_no_address -- so the breakpoint
-  * above would be stored at a garbage location and could never fire, while
-  * Z0 answered OK. Rather than lie about it, refuse outright so the caller
-  * sends E01. Protected-mode breakpoints are NOT implemented here -- this
-  * only stops the stub from claiming success for one it silently dropped.
-  * Real-mode behaviour (the case above) is unchanged. */
+  * In protected mode (cpu.pmode && !(reg_flags & FLAG_VM)) a linear address
+  * has no segment:offset form to fall back on -- GetAddress() would route
+  * through LinMakeProt() and treat the segment as a selector. Rather than
+  * lie about it, refuse outright so the caller sends E01. Protected-mode
+  * breakpoints are NOT implemented here -- this only stops the stub from
+  * claiming success for one it silently dropped. Real-mode behaviour (the
+  * case above) is unchanged. */
+
+ /* Highest linear address expressible as a real-mode segment:offset pair. */
+ #define GDB_BP_MAX_LINEAR 0x10FFEFu
+
+ static bool GDBSplitLinear(uint32_t address, uint16_t* seg, uint32_t* off) {
+     if (address > GDB_BP_MAX_LINEAR) return false;
+     uint32_t s = address >> 4;
+     if (s > 0xFFFFu) s = 0xFFFFu;
+     *seg = (uint16_t)s;
+     *off = address - (s << 4);
+     return true;
+ }
+
  bool DEBUG_SetBreakpoint(uint32_t address) {
      if (cpu.pmode && !(reg_flags & FLAG_VM)) {
          DEBUG_ShowMsg("Refusing breakpoint at linear %x: protected mode is not supported", address);
          return false;
      }
-     DEBUG_ShowMsg("Adding Breakpoint at linear %x", address);
-     return CBreakpoint::AddBreakpoint(0, address, false) != NULL;
+     uint16_t seg; uint32_t off;
+     if (!GDBSplitLinear(address, &seg, &off)) {
+         DEBUG_ShowMsg("Refusing breakpoint at linear %x: outside real-mode addressable memory", address);
+         return false;
+     }
+     DEBUG_ShowMsg("Adding Breakpoint at linear %x (%04X:%04X)", address, seg, off);
+     return CBreakpoint::AddBreakpoint(seg, off, false) != NULL;
  }
 
  bool DEBUG_RemoveBreakpoint(uint32_t address) {
@@ -6299,8 +6605,13 @@ uint32_t DEBUG_GetRegister(int reg) {
          DEBUG_ShowMsg("Refusing to remove breakpoint at linear %x: protected mode is not supported", address);
          return false;
      }
-     DEBUG_ShowMsg("Removing Breakpoint at linear %x", address);
-     return CBreakpoint::DeleteBreakpoint(0, address);
+     uint16_t seg; uint32_t off;
+     if (!GDBSplitLinear(address, &seg, &off)) {
+         DEBUG_ShowMsg("Refusing to remove breakpoint at linear %x: outside real-mode addressable memory", address);
+         return false;
+     }
+     DEBUG_ShowMsg("Removing Breakpoint at linear %x (%04X:%04X)", address, seg, off);
+     return CBreakpoint::DeleteBreakpoint(seg, off);
  }
 
 #if C_REMOTEDEBUG

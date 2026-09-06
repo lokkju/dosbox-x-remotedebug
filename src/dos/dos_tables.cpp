@@ -30,7 +30,9 @@
 extern int maxfcb;
 extern bool gbk, chinasea;
 extern Bitu DOS_PRIVATE_SEGMENT_Size;
+#if !defined(OSFREE)
 extern uint16_t desired_ems_segment;
+#endif
 extern bool private_segment_write_protect;
 #if defined(USE_TTF)
 extern bool ttf_dosv;
@@ -96,13 +98,17 @@ void DOS_GetMemory_unmap() {
 	}
 }
 
+#if !defined(OSFREE)
 bool DOS_User_Wants_UMBs() {
     const Section_prop* section = static_cast<Section_prop*>(control->GetSection("dos"));
     return section->Get_bool("umb");
 }
+#endif
 
+#if !defined(OSFREE)
 bool EMS_Active(void);
 void Update_Get_Desired_Segment(void);
+#endif
 
 /* Some DOS games and demoscene stuff has fast and loose VRAM rendering code that can spill
  * past video RAM into whatever follows in C0000h. If the DOSBox private area is there, then
@@ -124,14 +130,17 @@ void DOS_GetMemory_Choose() {
 		/* NTS: Code has been arranged so that DOS kernel init follows BIOS INT10h init */
 		DOS_PRIVATE_SEGMENT=(uint16_t)VGA_BIOS_SEG_END;
 
+#if !defined(OSFREE)
 		if (desired_ems_segment == 0) Update_Get_Desired_Segment();
 
 		if (DOS_PRIVATE_SEGMENT == desired_ems_segment) {
 			DOS_PRIVATE_SEGMENT += 0x1000; // FIXME
 		}
+#endif
 
 		DOS_PRIVATE_SEGMENT_END= (uint16_t)(DOS_PRIVATE_SEGMENT + DOS_PRIVATE_SEGMENT_Size);
 
+#if !defined(OSFREE)
 		if (IS_PC98_ARCH && (desired_ems_segment == 0xD000)) {
 			bool PC98_FM_SoundBios_Enabled(void);
 
@@ -157,6 +166,7 @@ void DOS_GetMemory_Choose() {
 			if (DOS_PRIVATE_SEGMENT >= DOS_PRIVATE_SEGMENT_END)
 				E_Exit("Insufficient room in upper memory area for private area");
 		}
+#endif
 
 		if (DOS_PRIVATE_SEGMENT >= 0xA000) {
 			memset(GetMemBase()+((Bitu)DOS_PRIVATE_SEGMENT<<4u),0x00,(Bitu)(DOS_PRIVATE_SEGMENT_END-DOS_PRIVATE_SEGMENT)<<4u);
@@ -250,6 +260,7 @@ PhysPt DOS_Get_DPB(unsigned int dos_drive) {
     return PhysMake(dos.tables.dpb,dos_drive*dos.tables.dpb_size);
 }
 
+#if !defined(OSFREE)
 void SetupDBCSTable() {
     if (enable_dbcs_tables) {
         if (!dos.tables.dbcs) dos.tables.dbcs=RealMake(DOS_GetMemory(12,"dos.tables.dbcs"),0);
@@ -288,6 +299,7 @@ void SetupDBCSTable() {
     if(dos.loaded_codepage == 950 && !chinasea) makestdcp950table();
     else if(dos.loaded_codepage == 951 && chinasea) makeseacp951table();
 }
+#endif
 
 uint16_t seg_win_startup_info;
 
@@ -375,10 +387,13 @@ void DOS_SetupTables(void) {
 	real_writed(seg,0x00,0x005c3a43);
 	dos_infoblock.SetCurDirStruct(RealMake(seg,0));
 
-    /* Allocate DBCS DOUBLE BYTE CHARACTER SET LEAD-BYTE TABLE */
-    dos.tables.dbcs = 0;
-    SetupDBCSTable();
+	/* Allocate DBCS DOUBLE BYTE CHARACTER SET LEAD-BYTE TABLE */
+	dos.tables.dbcs = 0;
+#if !defined(OSFREE)
+	SetupDBCSTable();
+#endif
 
+#if !defined(OSFREE)
 	/* FILENAME CHARACTER TABLE */
 	if (enable_filenamechar) {
 		dos.tables.filenamechar=RealMake(DOS_GetMemory(2,"dos.tables.filenamechar"),0);
@@ -406,9 +421,13 @@ void DOS_SetupTables(void) {
 		mem_writeb(Real2Phys(dos.tables.filenamechar)+0x16,0x3b);
 		mem_writeb(Real2Phys(dos.tables.filenamechar)+0x17,0x2c);
 	}
-	else {
+	else
+#endif
+	{
 		dos.tables.filenamechar = 0;
 	}
+
+#if !defined(OSFREE)
 	/* COLLATING SEQUENCE TABLE + UPCASE TABLE*/
 	// 256 bytes for col table, 128 for upcase, 4 for number of entries
 	if (enable_collating_uppercase) {
@@ -419,7 +438,9 @@ void DOS_SetupTables(void) {
 		mem_writew(Real2Phys(dos.tables.upcase),0x80);
 		for (i=0; i<128; i++) mem_writeb(Real2Phys(dos.tables.upcase)+i+2,(uint8_t)0x80+i);
 	}
-	else {
+	else
+#endif
+	{
 		dos.tables.collatingseq = 0;
 		dos.tables.upcase = 0;
 	}
@@ -456,7 +477,7 @@ void DOS_SetupTables(void) {
 	dos_infoblock.SetFirstDPB(RealMake(dos.tables.dpb,0));
 
 	/* Create Device command packet area */
-	dos.dcp = DOS_GetMemory(3, "External device command packet");
+	dos.dcp = DOS_GetMemory(dos.dcp_size_seg, "External device command packet");
 
 	/* Create a fake disk buffer head */
 	seg=DOS_GetMemory(6,"Fake disk buffer head");

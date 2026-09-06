@@ -54,6 +54,19 @@
 #include "../libs/zmbv/zmbv.h"
 #endif
 
+#include "../output/output_direct3d11.h"
+/* #include "../output/output_metal.h" */ // Includes Objective-C code
+#if C_METAL
+void metal_init();
+void OUTPUT_Metal_Select();
+Bitu OUTPUT_Metal_GetBestMode(Bitu flags);
+bool OUTPUT_Metal_StartUpdate(uint8_t*& pixels, Bitu& pitch);
+void OUTPUT_Metal_EndUpdate(const uint16_t* changedLines);
+Bitu OUTPUT_Metal_SetSize(void);
+void OUTPUT_Metal_Shutdown();
+void OUTPUT_Metal_CheckSourceResolution();
+#endif
+
 /* do not issue CPU-side I/O here -- this code emulates functions that the GDC itself carries out, not on the CPU */
 #include "cpu_io_is_forbidden.h"
 
@@ -72,6 +85,8 @@ static bool is_vga_rendering_on_demand = false;
 
 extern bool vga_render_on_demand;
 extern signed char vga_render_on_demand_user;
+extern bool vga_render_wait_for_changes;
+extern signed char vga_render_wait_for_changes_user;
 extern bool vga_ignore_extended_memory_bit;
 
 /* S3 streams processor state.
@@ -262,7 +277,6 @@ extern bool vga_page_flip_occurred;
 extern bool egavga_per_scanline_hpel;
 extern bool vga_enable_hpel_effects;
 extern bool vga_enable_hretrace_effects;
-extern const char* RunningProgram;
 extern unsigned int vga_display_start_hretrace;
 extern float hretrace_fx_avg_weight;
 extern bool ignore_vblank_wraparound;
@@ -314,8 +328,26 @@ typedef uint8_t * (* VGA_Line_Handler)(Bitu vidstart, Bitu line);
 
 static VGA_Line_Handler VGA_DrawLine;
 static VGA_RawLine_Handler VGA_DrawRawLine;
-static uint8_t TempLine[SCALER_MAXWIDTH * 4 + 256];
+static uint8_t *TempLine = NULL;
+static unsigned int TempLineSize = 0;
 static float hretrace_fx_avg = 0;
+
+bool TempLineAlloc(unsigned int w) {
+	if (TempLine) return false;
+
+	TempLineSize = w * 4 + 1024;
+	if ((TempLine=(uint8_t*)calloc(1,TempLineSize)) == NULL) {
+		TempLineSize = 0;
+		return false;
+	}
+
+	return true;
+}
+
+void TempLineFree(void) {
+	if (TempLine) free(TempLine);
+	TempLine = NULL;
+}
 
 void pc98_update_display_page_ptr(void);
 
@@ -328,27 +360,43 @@ static uint8_t * VGA_Draw_DOSBOXIG_None(Bitu vidstart, Bitu line) { // renders t
 }
 
 static uint8_t * VGA_Draw_DOSBOXIG_1bpp(Bitu vidstart, Bitu line) { // renders to 8bpp
-	(void)vidstart;
+	unsigned int xmax = vga.draw.width + (vga.draw.panning & 7u);
+	uint32_t *temp = (uint32_t*)TempLine;
+	unsigned char t;
+	unsigned int x;
+
 	(void)line;
 
-	memset(TempLine,0,vga.draw.width);
-	return TempLine;
+	for (x=0;x < xmax;x += 8,vidstart++) {
+		t = vga.mem.linear[vidstart & vga.draw.linear_mask];
+		temp[x+7] = vga.dac.xlat32[t&1u]; t >>= 1u;
+		temp[x+6] = vga.dac.xlat32[t&1u]; t >>= 1u;
+		temp[x+5] = vga.dac.xlat32[t&1u]; t >>= 1u;
+		temp[x+4] = vga.dac.xlat32[t&1u]; t >>= 1u;
+		temp[x+3] = vga.dac.xlat32[t&1u]; t >>= 1u;
+		temp[x+2] = vga.dac.xlat32[t&1u]; t >>= 1u;
+		temp[x+1] = vga.dac.xlat32[t&1u]; t >>= 1u;
+		temp[x+0] = vga.dac.xlat32[t&1u];
+	}
+
+	return (uint8_t*)(temp+(vga.draw.panning & 7u));
 }
 
-static uint8_t * VGA_Draw_DOSBOXIG_4bpp(Bitu vidstart, Bitu line) { // renders to 8bpp
+static uint8_t * VGA_Draw_DOSBOXIG_4bpp(Bitu vidstart, Bitu line) { // renders to 32bpp
+	unsigned int xmax = vga.draw.width + (vga.draw.panning & 1u);
 	uint32_t *temp = (uint32_t*)TempLine;
 	uint32_t ofs = (uint32_t)vidstart;
 	unsigned int x;
 
 	(void)line;
 
-	for (x=0;x < vga.draw.width;x += 2,ofs++) {
+	for (x=0;x < xmax;x += 2,ofs++) {
 		const uint8_t b = vga.mem.linear[ofs & vga.draw.linear_mask];
 		temp[x+0] = vga.dac.xlat32[b >> 4u];
 		temp[x+1] = vga.dac.xlat32[b & 0xFu];
 	}
 
-	return TempLine;
+	return (uint8_t*)(temp+(vga.draw.panning & 1u));
 }
 
 static uint8_t * VGA_Draw_DOSBOXIG_8bpp(Bitu vidstart, Bitu line) { // renders to 32bpp
@@ -691,6 +739,30 @@ static void VGA_RawDraw_2BPP_Line(uint8_t *dst,Bitu vidstart, Bitu line) {
 
 static uint8_t * VGA_Draw_2BPP_Line(Bitu vidstart, Bitu line) {
 	return VGA_Draw_2BPP_Line_Common<MCH_CGA,uint8_t>(TempLine,vidstart,line);
+}
+
+// IBM 3270 PC APA modes are LINEAR (350 lines of 90 bytes, no bank interleave), unlike the CGA/Hercules
+// layout. address_add is set to address_line_total*blocks so consecutive scanlines are contiguous, and
+// we reconstruct the linear byte offset as vidstart + line*blocks. addr_mask is widened to 0x7FFF (32KB).
+static uint8_t * VGA_Draw_3270_1BPP_Line(Bitu vidstart, Bitu line) {
+	Bitu addr = vidstart + line * vga.draw.blocks; // 720x350 mono: 90 bytes/line -> 720 pixels
+	uint32_t *draw = (uint32_t *)TempLine;
+	for (Bitu x=vga.draw.blocks;x>0;x--,addr++) {
+		const uint8_t val = vga.tandy.draw_base[addr & vga.tandy.addr_mask];
+		*draw++ = CGA_2_Table[val >> 4];
+		*draw++ = CGA_2_Table[val & 0xf];
+	}
+	return TempLine;
+}
+
+static uint8_t * VGA_Draw_3270_2BPP_Line(Bitu vidstart, Bitu line) {
+	Bitu addr = vidstart + line * vga.draw.blocks; // 360x350 4-color: 90 bytes/line -> 360 pixels
+	uint32_t *draw = (uint32_t *)TempLine;
+	for (Bitu x=vga.draw.blocks;x>0;x--,addr++) {
+		const uint8_t val = vga.tandy.draw_base[addr & vga.tandy.addr_mask];
+		*draw++ = CGA_4_Table[val];
+	}
+	return TempLine;
 }
 
 extern uint32_t CGA_4_HiRes_TableNP[256];
@@ -1099,6 +1171,25 @@ template <const unsigned int card,typename templine_type_t> static inline void E
     temps[5] = EGA_Planar_Common_Block_xlat<card,templine_type_t>((tmp>> 8ul)&0xFFul);
     temps[6] = EGA_Planar_Common_Block_xlat<card,templine_type_t>((tmp>>16ul)&0xFFul);
     temps[7] = EGA_Planar_Common_Block_xlat<card,templine_type_t>((tmp>>24ul)&0xFFul);
+}
+
+static uint8_t * VGA_Draw_DOSBOXIG_1bpp4plane(Bitu vidstart, Bitu line) { // renders to 8bpp
+	unsigned int xmax = vga.draw.width + (vga.draw.panning & 7u);
+	uint32_t ofs = (uint32_t)vidstart << 2u;
+	uint32_t *temp = (uint32_t*)TempLine;
+	uint32_t t1,t2;
+	unsigned int x;
+
+	(void)line;
+
+	for (x=0;x < xmax;x += 8,ofs += 4u) {
+		t1 = t2 = *((uint32_t*)(&vga.mem.linear[ofs & vga.draw.linear_mask]));
+		t1 = (t1 >> 4) & 0x0f0f0f0f;
+		t2 &= 0x0f0f0f0f;
+		EGA_Planar_Common_Block<MCH_VGA,uint32_t>(temp+x,t1,t2);
+	}
+
+	return (uint8_t*)(temp+(vga.draw.panning & 7u));
 }
 
 /* NTS: For EGA/VGA machine types this code is also used to render the CGA 640x200 2-color and MCGA 640x480 2-color modes.
@@ -1962,9 +2053,9 @@ static const uint8_t* VGA_Text_Memwrap(Bitu vidstart) {
         // wrapping in this line
         Bitu break_pos = (vga.draw.linear_mask - vidstart) + 1;
         // need a temporary storage - TempLine/2 is ok for a bit more than 132 columns
-        memcpy(&TempLine[sizeof(TempLine)/2], &vga.tandy.draw_base[vidstart], break_pos);
-        memcpy(&TempLine[sizeof(TempLine)/2 + break_pos],&vga.tandy.draw_base[0], line_end - break_pos);
-        return &TempLine[sizeof(TempLine)/2];
+        memcpy(&TempLine[TempLineSize/2], &vga.tandy.draw_base[vidstart], break_pos);
+        memcpy(&TempLine[TempLineSize/2 + break_pos],&vga.tandy.draw_base[0], line_end - break_pos);
+        return &TempLine[TempLineSize/2];
     } else return &vga.tandy.draw_base[vidstart];
 }
 
@@ -2542,7 +2633,7 @@ template <const unsigned int card,typename templine_type_t> static inline uint8_
 #if defined(USE_TTF)
                    && dbcs_sbcs
 #endif
-                   && showdbcs) && CurMode && CurMode->type == M_TEXT && !dos_kernel_disabled && strcmp(RunningProgram, "LOADLIN"));
+                   && showdbcs) && CurMode && CurMode->type == M_TEXT && !dos_kernel_disabled && RunningProgram != "LOADLIN");
 
     if (usedbcs && (vga.draw.height < 16u || vga.draw.width < 8u)) return dst;
 
@@ -3611,7 +3702,7 @@ static uint8_t *VGA_DrawLineBiosLogoOverlay(Bitu vidstart, Bitu line) {
 	 * corruption. Modifying TempLine, which is basically the same exact memory "r" points to, does not. */
 
 	if (BIOSlogo.bmp != NULL && BIOSlogo.palette != NULL && BIOSlogo.visible && BIOSlogo.vsync_enable) {
-		if (vga.draw.lines_done >= BIOSlogo.y && r >= TempLine && r < (TempLine+sizeof(TempLine))) {
+		if (vga.draw.lines_done >= BIOSlogo.y && r >= TempLine && r < (TempLine+TempLineSize)) {
 			const unsigned int rel = vga.draw.lines_done - BIOSlogo.y;
 			const unsigned int bofs = (unsigned int)(r - TempLine);
 			if (rel < BIOSlogo.height) {
@@ -3698,6 +3789,8 @@ static void VGA_DrawSingleLine(Bitu /*blah*/) {
     bool skiprender;
 
     vga.draw.hsync_events++;
+    if (vga.draw.lines_done == 0)
+        vga.draw.must_complete_frame = true; /* frame started, vsync must complete it */
 
 again:
     if (vga.draw.render_step == 0)
@@ -3730,7 +3823,7 @@ again:
         }
 
         VGA_DAC_DeferredUpdateColorPalette();
-        if (GCC_UNLIKELY(vga.attr.disabled)) {
+        if (GCC_UNLIKELY(vga.attr.disabled && !vga.dosboxig.svga)) {
             switch(machine) {
                 case MCH_PCJR:
                     // Displays the border color when screen is disabled
@@ -3770,17 +3863,17 @@ again:
                     break;
             }
             if (vga.draw.bpp==8) {
-                memset(TempLine, bg_color_index, sizeof(TempLine));
+                memset(TempLine, bg_color_index, TempLineSize);
             } else if (vga.draw.bpp==16) {
                 uint16_t* wptr = (uint16_t*) TempLine;
                 uint16_t value = vga.dac.xlat16[bg_color_index];
-                for (Bitu i = 0; i < sizeof(TempLine)/2; i++) {
+                for (Bitu i = 0; i < TempLineSize/2; i++) {
                     wptr[i] = value;
                 }
             } else if (vga.draw.bpp==32) {
                 uint32_t* wptr = (uint32_t*) TempLine;
                 uint32_t value = vga.dac.xlat32[bg_color_index];
-                for (Bitu i = 0; i < sizeof(TempLine)/4; i++) {
+                for (Bitu i = 0; i < TempLineSize/4; i++) {
                     wptr[i] = value;
                 }
             }
@@ -3866,7 +3959,7 @@ again:
 
     if (!skiprender) {
         vga.draw.lines_done++;
-        if (vga.draw.split_line==vga.draw.lines_done && machine != MCH_PC98) VGA_ProcessSplit();
+        if (vga.draw.split_line==vga.draw.lines_done && machine != MCH_PC98 && !vga.dosboxig.svga) VGA_ProcessSplit();
     }
 
     if (mcga_double_scan) {
@@ -3880,6 +3973,7 @@ again:
         if (!is_vga_rendering_on_demand)
             PIC_AddEvent(VGA_DrawSingleLine,vga.draw.delay.singleline_delay);
     } else {
+        vga.draw.must_complete_frame = false;
         vga_mode_frames_since_time_base++;
         RENDER_EndUpdate(false);
     }
@@ -3918,12 +4012,15 @@ static void VGA_DrawEGASingleLine(Bitu /*blah*/) {
     else
         skiprender = true;
 
+    if (vga.draw.lines_done == 0)
+        vga.draw.must_complete_frame = true; /* frame started, vsync must complete it */
+
     if ((++vga.draw.render_step) >= vga.draw.render_max)
         vga.draw.render_step = 0;
 
     if (!skiprender) {
-        if (GCC_UNLIKELY(vga.attr.disabled)) {
-            memset(TempLine, 0, sizeof(TempLine));
+        if (GCC_UNLIKELY(vga.attr.disabled && !vga.dosboxig.svga)) {
+            memset(TempLine, 0, TempLineSize);
             RENDER_DrawLine(TempLine);
         } else {
             Bitu address = vga.draw.address;
@@ -3964,12 +4061,13 @@ static void VGA_DrawEGASingleLine(Bitu /*blah*/) {
 
     if (!skiprender) {
         vga.draw.lines_done++;
-        if (vga.draw.split_line==vga.draw.lines_done && machine != MCH_PC98) VGA_ProcessSplit();
+        if (vga.draw.split_line==vga.draw.lines_done && machine != MCH_PC98 && !vga.dosboxig.svga) VGA_ProcessSplit();
     }
 
     if (vga.draw.lines_done < vga.draw.lines_total) {
         PIC_AddEvent(VGA_DrawEGASingleLine,vga.draw.delay.singleline_delay);
     } else {
+        vga.draw.must_complete_frame = false;
         vga_mode_frames_since_time_base++;
         RENDER_EndUpdate(false);
     }
@@ -4019,6 +4117,12 @@ void VGA_RenderOnDemandUpTo(void) {
 //assert(vga_render_on_demand);
 
     if (scanline < 0) scanline = 0;
+
+    /* if something changed mid-frame, then the frame must be drawn again to reflect it.
+     * unless of course you like to see tearlines and the output stuck on half-drawn frames. */
+    if (vga.draw.lines_done != 0)
+        vga.draw.must_draw_again = true;
+
     while (vga.draw.lines_done < vga.draw.lines_total && vga.draw.hsync_events < (unsigned int)scanline && patience-- > 0)
         VGA_DrawSingleLine(0);
 }
@@ -4032,10 +4136,18 @@ void VGA_RenderOnDemandComplete(void) {
         VGA_DrawSingleLine(0);
 }
 
-static void VGA_VertInterrupt(Bitu /*val*/) {
-    if (is_vga_rendering_on_demand)
-        VGA_RenderOnDemandComplete();
+/* WARNING: Do not call this more than once per frame! Events will get missed if you do. */
+static void OnDemandCompleteFrame(void) {
+    if (is_vga_rendering_on_demand) {
+        if (vga.draw.must_complete_frame || !vga_render_wait_for_changes)
+            VGA_RenderOnDemandComplete();
+    }
 
+    vga.draw.must_complete_frame |= vga.draw.must_draw_again;
+    vga.draw.must_draw_again = false;
+}
+
+static void VGA_VertInterrupt(Bitu /*val*/) {
     if (IS_PC98_ARCH) {
         if (GDC_vsync_interrupt) {
             GDC_vsync_interrupt = false;
@@ -4051,23 +4163,30 @@ static void VGA_VertInterrupt(Bitu /*val*/) {
 }
 
 static void VGA_Other_VertInterrupt(Bitu val) {
-    if (is_vga_rendering_on_demand)
-        VGA_RenderOnDemandComplete();
-
     if (val) PIC_ActivateIRQ(5);
     else PIC_DeActivateIRQ(5);
 }
 
 static void VGA_DisplayStartLatch(Bitu /*val*/) {
-    if (is_vga_rendering_on_demand)
-        VGA_RenderOnDemandComplete();
+    const Bitu old_start = vga.config.real_start;
+
+    if (!IS_PC98_ARCH) OnDemandCompleteFrame();
 
     /* hretrace fx support: store the hretrace value at start of picture so we have
      * a point of reference how far to displace the scanline when wavy effects are
      * made */
     vga_display_start_hretrace = vga.crtc.start_horizontal_retrace;
-    vga.config.real_start=vga.config.display_start & vga.mem.memmask;
+    vga.config.real_start = vga.config.display_start & vga.mem.memmask;
     vga.draw.bytes_skip = vga.config.bytes_skip;
+
+    if (vga_render_wait_for_changes) {
+        if (vga.config.real_start != old_start) {
+            if (!vga.draw.must_complete_frame) {
+                LOG_MSG("Real start change unexpected");
+                vga.draw.must_complete_frame = true;
+            }
+        }
+    }
 
     if (vga.overopts.enable) {
 	    if (vga.overopts.start != ~uint32_t(0u)) {
@@ -4085,10 +4204,12 @@ static void VGA_DisplayStartLatch(Bitu /*val*/) {
 }
  
 static void VGA_PanningLatch(Bitu /*val*/) {
-    if (is_vga_rendering_on_demand)
-        VGA_RenderOnDemandComplete();
+    if (IS_PC98_ARCH) OnDemandCompleteFrame();
 
-    vga.draw.panning = vga.config.pel_panning;
+    if (vga.dosboxig.svga)
+        vga.draw.panning = vga.dosboxig.hpel;
+    else
+        vga.draw.panning = vga.config.pel_panning;
 
     if (IS_PC98_ARCH) {
         for (unsigned int i=0;i < 2;i++)
@@ -4254,6 +4375,7 @@ static void VGA_debug_screen_resize(size_t w,size_t h,size_t bpp) {
 
 void VGA_DebugOverlay() {
     if (VGA_debug_screen == NULL || VGA_debug_screen_w < render.src.width) return;
+    if (vga.draw.lines_done < vga.draw.lines_total) return;
 
     for (unsigned int y=0;y < VGA_debug_screen_h && render.scale.inLine < render.src.height;y++)
         RENDER_DrawLine(VGA_debug_screen+(y*VGA_debug_screen_stride));
@@ -4694,6 +4816,8 @@ void VGA_DrawDebugLine(uint8_t *line,unsigned int w) {
 	if (allclear) debugline_events.clear();
 }
 
+static unsigned char single_digit_frame_count = 0;
+
 void VGA_sof_debug_video_info(void) {
 	unsigned int green,white;
 	char tmp[256];
@@ -4736,8 +4860,17 @@ void VGA_sof_debug_video_info(void) {
 	};
 
 	x = y = 4;
-	x = VGA_debug_screen_puts8(x,y,mode_texts[vga.mode],green) + 8;
-	if (vga.dosboxig.svga) x = VGA_debug_screen_puts8(x,y,"DBIG",green) + 8;
+	if (is_vga_rendering_on_demand && vga_render_wait_for_changes) {
+		x = VGA_debug_screen_puts8(x,y,mode_texts[vga.mode],green);
+
+		tmp[0] = ':';
+		tmp[1] = '0' + single_digit_frame_count;
+		tmp[2] = 0;
+		x = VGA_debug_screen_puts8(x,y,tmp,white) + 8;
+	}
+	else {
+		x = VGA_debug_screen_puts8(x,y,mode_texts[vga.mode],green) + 8;
+	}
 
 	/* 2023/04/26: DOSBox-X users are probably going to discover the "Video debug overlay" and then immediately
 	 *             point out the "bug" that it's showing M_EGA for CGA/MCGA 2-color graphics modes. It's not a
@@ -4844,18 +4977,22 @@ void VGA_sof_debug_video_info(void) {
 		unsigned int interleave_mul = 1;
 		char *d = tmp;
 
-		if (machine == MCH_CGA || machine == MCH_TANDY || machine == MCH_PCJR || machine == MCH_HERC || machine == MCH_AMSTRAD) {
-			if (rowdiv == 2 || rowdiv == 4) rowdiv = 1; /* CGA graphics use interleaving to accomplish 200 lines, Tandy and Hercules use 4-way interleaving in some modes */
+		if (vga.dosboxig.svga) {
+			/* do not change */
 		}
-		else if (machine == MCH_EGA || machine == MCH_VGA) {
+		else if (machine == MCH_CGA || machine == MCH_TANDY || machine == MCH_PCJR || machine == MCH_HERC || machine == MCH_AMSTRAD || machine == MCH_EGA || machine == MCH_VGA) {
 			/* EGA/VGA have bits set to display video memory 2-way interleave like CGA and even 4-way interleave like Hercules */
-			if (vga.tandy.line_mask & 2) interleave_mul = 4;
-			else if (vga.tandy.line_mask & 1) interleave_mul = 2;
+			if ((vga.tandy.line_mask & 2) && rowdiv > 2) interleave_mul = 4;
+			else if ((vga.tandy.line_mask & 1) && rowdiv > 1) interleave_mul = 2;
 		}
 
-		d += sprintf(d,"G%ux%u>%ux%u",
-			(unsigned int)vga.draw.width,((unsigned int)vga.draw.height * interleave_mul) / rowdiv,
-			(unsigned int)vga.draw.width,(unsigned int)vga.draw.height);
+		/* render_max == 2 and address_line_total == 2 can happen if the user disabled doublescan mode */
+		interleave_mul *= vga.draw.render_max;
+
+		d += sprintf(d,"G%ux%u>%u",
+			(unsigned int)vga.draw.width,
+			((unsigned int)vga.draw.height * interleave_mul) / rowdiv,
+			(unsigned int)vga.draw.height);
 
 		if (machine == MCH_HERC) {
 			if (hercCard >= HERC_InColor) {
@@ -4913,6 +5050,14 @@ void VGA_sof_debug_video_info(void) {
 		}
 
 		d += sprintf(d," pg:c%ud%u",(pc98_gdc_vramop & (1 << VOPBIT_ACCESS))?1:0,GDC_display_plane_pending);
+	}
+	else if (vga.dosboxig.svga) {
+		char *d = tmp;
+
+		d += sprintf(d,"@%04x+%04xL",
+			(unsigned int)vga.dosboxig.display_offset,(unsigned int)vga.dosboxig.bytes_per_scanline);
+
+		*d = 0;
 	}
 	else if (IS_EGAVGA_ARCH) {
 		char *d = tmp;
@@ -5289,91 +5434,117 @@ void VGA_sof_debug_video_info(void) {
 			x = 4;
 			y += 8*2; /* next line */
 
-			/* effective PAL (after all remapping) */
-			sprintf(tmp,"EPAL%u:",vga_8bit_dac?8:6);
-			x = VGA_debug_screen_puts8(x,y,tmp,white) + 8;
-			if (vga.mode == M_LIN8 || vga.mode == M_VGA) {
-				VGA_debug_screen_func->rect(x-1,y,x,y+(4*4),dkgray);
-				VGA_debug_screen_func->rect(x-1,y,x+(4*64),y+1,dkgray);
-				VGA_debug_screen_func->rect(x-1,y+(4*4)-1,x+(4*64),y+(4*4),dkgray);
-				for (unsigned int c=0;c < 256;c++) {
-					const int bx = x+((c&63)*4),by = y+((c>>6)*4);
-					VGA_debug_screen_func->rect(bx,by+1,bx+3,by+4,vga.dac.xlat32[c]); /* xlat32[] already contains the translated color */
-					VGA_debug_screen_func->rect(bx+3,by+1,bx+4,by+4,dkgray);
-				}
-			}
-			else {
-				unsigned int colors = 16;
+			if (vga.dosboxig.svga) {
+				char *d = tmp;
 
-				if (!(vga.mode == M_TEXT || vga.mode == M_TANDY_TEXT || vga.mode == M_HERC_TEXT)) {
-					unsigned char chk = vga.attr.color_plane_enable;
+				y += 1; /* please do not overlap the rpal display */
 
-					if (vga.gfx.mode & 0x20/*CGA 4-color*/)
-						chk |= (chk & 0x5u) << 1u; /* bit 0->1 and 2->3 */
+				d += sprintf(d,"HPL=%u VPL=%u HSC=%u VSC=%u",
+					(unsigned int)vga.dosboxig.hpel,(unsigned int)vga.dosboxig.vpel,
+					(unsigned int)vga.dosboxig.hscale,(unsigned int)vga.dosboxig.vscale);
 
-					if (chk & 8) colors = 16;
-					else if (chk & 4) colors = 8;
-					else if (chk & 2) colors = 4;
-					else colors = 2;
-				}
+				if (vga.dosboxig.dar_width != 0 && vga.dosboxig.dar_height != 0)
+					d += sprintf(d," DAR=%u:%u",vga.dosboxig.dar_width,vga.dosboxig.dar_height);
+				else
+					d += sprintf(d," DAR=%.3f",vga.draw.screen_ratio);
 
-				VGA_debug_screen_func->rect(x-1,y,x+(8*colors),y+1,dkgray);
-				VGA_debug_screen_func->rect(x-1,y+7,x+(8*colors),y+8,dkgray);
-				for (unsigned int c=0;c < colors;c++) {
-					VGA_debug_screen_func->rect(x,y+1,x+7,y+7,vga.dac.xlat32[c]);
-					VGA_debug_screen_func->rect(x+7,y+1,x+8,y+7,dkgray);
-					x += 8;
-				}
-			}
+				*d = 0;
 
-			x = 4;
-			y += 8*2; /* next line */
-
-			if (IS_VGA_ARCH) {
-				/* attribute controller PAL */
-				x = VGA_debug_screen_puts8(x,y,"ACPAL:",white) + 8;
-				VGA_debug_screen_func->rect(x-1,y,x+(8*16),y+1,dkgray);
-				VGA_debug_screen_func->rect(x-1,y+7,x+(8*16),y+8,dkgray);
-				for (unsigned int c=0;c < 16;c++) {
-					const unsigned int idx = vga.attr.palette[c]&0x3F;
-					const unsigned int color = SDL_MapRGB(
-						sdl.surface->format,
-						((vga.dac.rgb[idx].red << dacshift) & 0xFF),
-						((vga.dac.rgb[idx].green << dacshift) & 0xFF),
-						((vga.dac.rgb[idx].blue << dacshift) & 0xFF));
-					VGA_debug_screen_func->rect(x,y+1,x+7,y+7,color);
-					VGA_debug_screen_func->rect(x+7,y+1,x+8,y+7,dkgray);
-					x += 8;
-				}
-
-				x += 8;
-
-				sprintf(tmp,"CPE%x HPL%x YP%02x",vga.attr.color_plane_enable&0xF,vga.config.pel_panning&0xF,vga.config.hlines_skip); /* 4 bits, 4 bitplanes, one hex digit */
 				x = VGA_debug_screen_puts8(x,y,tmp,white) + 8;
 
 				x = 4;
-				y += 8; /* next line */
+				y += 8*2; /* next line */
+			}
+			else {
+				/* effective PAL (after all remapping) */
+				sprintf(tmp,"EPAL%u:",vga_8bit_dac?8:6);
+				x = VGA_debug_screen_puts8(x,y,tmp,white) + 8;
+				if (vga.mode == M_LIN8 || vga.mode == M_VGA) {
+					VGA_debug_screen_func->rect(x-1,y,x,y+(4*4),dkgray);
+					VGA_debug_screen_func->rect(x-1,y,x+(4*64),y+1,dkgray);
+					VGA_debug_screen_func->rect(x-1,y+(4*4)-1,x+(4*64),y+(4*4),dkgray);
+					for (unsigned int c=0;c < 256;c++) {
+						const int bx = x+((c&63)*4),by = y+((c>>6)*4);
+						VGA_debug_screen_func->rect(bx,by+1,bx+3,by+4,vga.dac.xlat32[c]); /* xlat32[] already contains the translated color */
+						VGA_debug_screen_func->rect(bx+3,by+1,bx+4,by+4,dkgray);
+					}
+				}
+				else {
+					unsigned int colors = 16;
 
-				/* attribute controller PAL with color select and other in force */
-				x = VGA_debug_screen_puts8(x,y,"CSPAL:",white) + 8;
-				VGA_debug_screen_func->rect(x-1,y,x+(8*16),y+1,dkgray);
-				VGA_debug_screen_func->rect(x-1,y+7,x+(8*16),y+8,dkgray);
-				for (unsigned int c=0;c < 16;c++) {
-					const unsigned int idx = vga.dac.combine[c]; /* vga_dac.cpp considers color select */
-					const unsigned int color = SDL_MapRGB(
-						sdl.surface->format,
-						((vga.dac.rgb[idx].red << dacshift) & 0xFF),
-						((vga.dac.rgb[idx].green << dacshift) & 0xFF),
-						((vga.dac.rgb[idx].blue << dacshift) & 0xFF));
-					VGA_debug_screen_func->rect(x,y+1,x+7,y+7,color);
-					VGA_debug_screen_func->rect(x+7,y+1,x+8,y+7,dkgray);
-					x += 8;
+					if (!(vga.mode == M_TEXT || vga.mode == M_TANDY_TEXT || vga.mode == M_HERC_TEXT)) {
+						unsigned char chk = vga.attr.color_plane_enable;
+
+						if (vga.gfx.mode & 0x20/*CGA 4-color*/)
+							chk |= (chk & 0x5u) << 1u; /* bit 0->1 and 2->3 */
+
+						if (chk & 8) colors = 16;
+						else if (chk & 4) colors = 8;
+						else if (chk & 2) colors = 4;
+						else colors = 2;
+					}
+
+					VGA_debug_screen_func->rect(x-1,y,x,y+8,dkgray);
+					VGA_debug_screen_func->rect(x-1,y,x+(8*colors),y+1,dkgray);
+					VGA_debug_screen_func->rect(x-1,y+7,x+(8*colors),y+8,dkgray);
+					for (unsigned int c=0;c < colors;c++) {
+						VGA_debug_screen_func->rect(x,y+1,x+7,y+7,vga.dac.xlat32[c]);
+						VGA_debug_screen_func->rect(x+7,y+1,x+8,y+7,dkgray);
+						x += 8;
+					}
 				}
 
-				x += 8;
+				x = 4;
+				y += 8*2; /* next line */
 
-				sprintf(tmp,"PM%02x MD%02x CS%02x",vga.dac.pel_mask,vga.attr.mode_control,vga.attr.color_select);
-				x = VGA_debug_screen_puts8(x,y,tmp,white) + 8;
+				if (IS_VGA_ARCH) {
+					/* attribute controller PAL */
+					x = VGA_debug_screen_puts8(x,y,"ACPAL:",white) + 8;
+					VGA_debug_screen_func->rect(x-1,y,x,y+8,dkgray);
+					VGA_debug_screen_func->rect(x-1,y,x+(8*16),y+1,dkgray);
+					VGA_debug_screen_func->rect(x-1,y+7,x+(8*16),y+8,dkgray);
+					for (unsigned int c=0;c < 16;c++) {
+						const unsigned int idx = vga.attr.palette[c]&0x3F;
+						const unsigned int color = SDL_MapRGB(
+								sdl.surface->format,
+								((vga.dac.rgb[idx].red << dacshift) & 0xFF),
+								((vga.dac.rgb[idx].green << dacshift) & 0xFF),
+								((vga.dac.rgb[idx].blue << dacshift) & 0xFF));
+						VGA_debug_screen_func->rect(x,y+1,x+7,y+7,color);
+						VGA_debug_screen_func->rect(x+7,y+1,x+8,y+7,dkgray);
+						x += 8;
+					}
+
+					x += 8;
+
+					sprintf(tmp,"CPE%x HPL%x YP%02x",vga.attr.color_plane_enable&0xF,vga.config.pel_panning&0xF,vga.config.hlines_skip); /* 4 bits, 4 bitplanes, one hex digit */
+					x = VGA_debug_screen_puts8(x,y,tmp,white) + 8;
+
+					x = 4;
+					y += 8; /* next line */
+
+					/* attribute controller PAL with color select and other in force */
+					x = VGA_debug_screen_puts8(x,y,"CSPAL:",white) + 8;
+					VGA_debug_screen_func->rect(x-1,y,x,y+8,dkgray);
+					VGA_debug_screen_func->rect(x-1,y,x+(8*16),y+1,dkgray);
+					VGA_debug_screen_func->rect(x-1,y+7,x+(8*16),y+8,dkgray);
+					for (unsigned int c=0;c < 16;c++) {
+						const unsigned int idx = vga.dac.combine[c]; /* vga_dac.cpp considers color select */
+						const unsigned int color = SDL_MapRGB(
+								sdl.surface->format,
+								((vga.dac.rgb[idx].red << dacshift) & 0xFF),
+								((vga.dac.rgb[idx].green << dacshift) & 0xFF),
+								((vga.dac.rgb[idx].blue << dacshift) & 0xFF));
+						VGA_debug_screen_func->rect(x,y+1,x+7,y+7,color);
+						VGA_debug_screen_func->rect(x+7,y+1,x+8,y+7,dkgray);
+						x += 8;
+					}
+
+					x += 8;
+
+					sprintf(tmp,"PM%02x MD%02x CS%02x",vga.dac.pel_mask,vga.attr.mode_control,vga.attr.color_select);
+					x = VGA_debug_screen_puts8(x,y,tmp,white) + 8;
+				}
 			}
 
 			/* point out where side debug info is */
@@ -5465,6 +5636,9 @@ void VGA_sof_debug_video_info(void) {
 			VGA_debug_screen_puts8(x,y+16,"E",0);
 		}
 	}
+
+	if ((++single_digit_frame_count) >= 10)
+		single_digit_frame_count = 0;
 }
 
 static inline uint8_t dacexpand(const uint8_t v,const uint8_t dacshl,const uint8_t dacshr) {
@@ -5837,9 +6011,6 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 		pc98_update_display_page_ptr();
 	}
 
-	if (is_vga_rendering_on_demand)
-		VGA_RenderOnDemandComplete();
-
 	is_vga_rendering_on_demand = vga_render_on_demand;
 	if (CaptureState & CAPTURE_RAWIMAGE) {
 		if (!rawshot.capturing) {
@@ -6006,6 +6177,8 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 			// fall-through
 		case MCH_AMSTRAD:
 		case MCH_CGA:
+		case MCH_OLIVETTI:
+		case MCH_3270PC:
 		case MCH_MDA:
 		case MCH_MCGA:
 		case MCH_HERC:
@@ -6038,6 +6211,16 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 			break;
 	}
 
+	if (video_debug_overlay && render.src.height > vga.draw.height && vga.draw.bpp == render.src.bpp)
+		VGA_debug_screen_resize(render.src.width,render.src.height - vga.draw.height,vga.draw.bpp);
+	else
+		VGA_debug_screen_free();
+
+	if (video_debug_overlay && VGA_debug_screen && vga.draw.lines_done >= vga.draw.lines_total) {
+		VGA_debug_screen_func->clear(0);
+		VGA_sof_debug_video_info();
+	}
+
 	// for same blinking frequency with higher frameskip
 	if (IS_JEGA_ARCH) {
 		ccount++;
@@ -6048,13 +6231,54 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 	} else
 		vga.draw.cursor.count++;
 
+	// render on demand + wait for changes needs to render frame when cursor blinks.
+	// most code uses 8 frames for cursor blink and 16 frames for attribute blink.
+	if (!IS_PC98_ARCH && (vga.mode == M_TEXT || vga.mode == M_TANDY_TEXT || vga.mode == M_HERC_TEXT) && (vga.draw.cursor.enabled || vga.draw.blinking)) {
+		const unsigned int chkmsk = vga.draw.cursor.enabled ? 0x7 : 0xF;
+		if ((vga.draw.cursor.count&chkmsk) == 0)
+			vga.draw.must_complete_frame = true;
+	}
+
 	if (IS_PC98_ARCH) {
 		for (unsigned int i=0;i < 2;i++)
 			pc98_gdc[i].cursor_advance();
 	}
 
-	//Check if we can actually render, else skip the rest
-	if (vga.draw.vga_override || !RENDER_StartUpdate()) return;
+	bool renderAbort = false;
+
+	switch (vga.draw.mode) {
+		case DRAWLINE:
+		case EGALINE:
+			if (GCC_UNLIKELY(vga.draw.lines_done < vga.draw.lines_total)) {
+				vga_mode_frames_since_time_base++;
+				if (vga_render_wait_for_changes && vga.draw.lines_done == 0) {
+					/* do nothing */
+				}
+				else {
+					LOG(LOG_VGAMISC,LOG_NORMAL)( "Lines left: %d",
+						(int)(vga.draw.lines_total-vga.draw.lines_done));
+					renderAbort = true;
+				}
+			}
+			break;
+		default:
+			break;
+	}
+	RENDER_EndUpdate(renderAbort);
+	vga.draw.lines_done = 0;
+
+#if C_DIRECT3D && defined(C_SDL2)
+    if(sdl.desktop.type == SCREEN_DIRECT3D11) {
+        OUTPUT_DIRECT3D11_CheckSourceResolution();
+    }
+#endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+    if(sdl.desktop.type == SCREEN_METAL) {
+        OUTPUT_Metal_CheckSourceResolution();
+    }
+#endif
+    //Check if we can actually render, else skip the rest
+    if (vga.draw.vga_override || !RENDER_StartUpdate()) return;
 
 	if (svgaCard == SVGA_S3Trio) {
 		if (s3Card >= S3_ViRGE || s3Card == S3_Trio64V) {
@@ -6106,6 +6330,7 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 
 	if (vga.dosboxig.svga) {
 		vga.draw.address = vga.dosboxig.display_offset;
+		vga.draw.linear_mask = vga.mem.memmask;
 		vga.draw.address_line = 0;
 	}
 	else {
@@ -6259,7 +6484,7 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 		}
 
 		/* do VGA split now if line compare <= 0. NTS: vga.draw.split_line is defined as Bitu (unsigned integer) so we need the typecast. */
-		if (GCC_UNLIKELY((Bits)vga.draw.split_line <= 0) && machine != MCH_PC98) {
+		if (GCC_UNLIKELY((Bits)vga.draw.split_line <= 0) && machine != MCH_PC98 && !vga.dosboxig.svga) {
 			VGA_ProcessSplit();
 
 			/* if vblank_skip != 0, line compare can become a negative value! Fixes "Warlock" 1992 demo by Warlock */
@@ -6270,13 +6495,68 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 		}
 	}
 
+	// default catch all memory access to trigger updates
+	vga.draw.draw_base_planar = 0;
+	vga.draw.draw_base_size = 0xFFFFFFFFu;
+
+	if (IS_PC98_ARCH) {
+		// TODO
+	}
+	// EGA/VGA: The mem write range check must be kept simple! if ((addr-base) < size)...  anything more complex will slow emulation down.
+	//          That means if the line compare is in use to split the screen (Epic Pinball) then we have to set the range to count any change
+	//          from VGA base memory to line compare as visible.
+	//
+	//          NTS: address_add was already multiplied by 1 << addr_shift
+	//
+	// FIXME: This works for standard VGA modes but does not take SVGA bank switching into account!
+	//        Perhaps this should move into a central function that both vertical timer and the SVGA bank switching handling
+	//        can call to correctly map planar writes (0xA0000-0xBFFFF) to the vga draw address to determine when writes lie
+	//        within the visible video memory.
+	else if (IS_EGAVGA_ARCH) {
+		if (vga.draw.split_line < vga.draw.height) {
+			vga.draw.draw_base_planar = 0;
+			vga.draw.draw_base_size = vga.draw.address +
+				(vga.draw.address_add *
+					((vga.draw.split_line + vga.draw.address_line_total - 1) / vga.draw.address_line_total));
+		}
+		else {
+			vga.draw.draw_base_planar = vga.draw.address;
+			vga.draw.draw_base_size = vga.draw.address_add *
+				((vga.draw.height + vga.draw.address_line_total - 1) / vga.draw.address_line_total);
+		}
+
+		// FIXME: The planar render code counts bytes in vram buffer, not planar bytes.
+		//        M_EGA/M_LIN4 should count by planar bytes as it does now for the DOSBox IG version of planar 16-color.
+		if (vga.mode == M_EGA || vga.mode == M_LIN4) {
+			vga.draw.draw_base_planar >>= 2u;
+			vga.draw.draw_base_size >>= 2u;
+		}
+		else if (vga.mode == M_VGA) {
+			vga.draw.draw_base_planar >>= 2u;
+			vga.draw.draw_base_size >>= 2u;
+		}
+	}
+	else {
+		// TODO
+	}
+
+#if 0//DEBUG
+	if (vga.draw.draw_base_size != 0) {
+		LOG(LOG_MISC,LOG_DEBUG)("VGA draw mem planar check 0x%x-0x%x",
+			(unsigned int)vga.draw.draw_base_planar,(unsigned int)vga.draw.draw_base_planar+vga.draw.draw_base_size-1u);
+	}
+	else {
+		LOG(LOG_MISC,LOG_DEBUG)("VGA draw mem planar check disabled");
+	}
+#endif
+
 	// NTS: To be moved
 	if (autosave_second>0&&enable_autosave) {
 		uint32_t ticksNew=GetTicks();
 		if (ticksNew-ticksPrev>(unsigned int)autosave_second*1000) {
 			auto_save_state=true;
 			int index=0;
-			for (int i=1; i<10&&i<=autosave_count; i++) if (autosave_name[i].size()&&!strcasecmp(RunningProgram, autosave_name[i].c_str())) index=i;
+			for (int i=1; i<10&&i<=autosave_count; i++) if (autosave_name[i].size()&&!strcasecmp(RunningProgram.c_str(), autosave_name[i].c_str())) index=i;
 			if (autosave_start[index]>=1&&autosave_start[index]<=100) {
 				if (autosave_end[index]>=autosave_start[index]&&autosave_end[index]<=100&&autosave_end[index]>autosave_start[index]) {
 					if (autosave_end[index]>autosave_last[index]&&autosave_last[index]>=autosave_start[index]) autosave_last[index]++;
@@ -6579,29 +6859,10 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 	}
 #endif
 
-	if (video_debug_overlay && render.src.height > vga.draw.height && vga.draw.bpp == render.src.bpp)
-		VGA_debug_screen_resize(render.src.width,render.src.height - vga.draw.height,vga.draw.bpp);
-	else
-		VGA_debug_screen_free();
-
-	if (video_debug_overlay && VGA_debug_screen) {
-		VGA_debug_screen_func->clear(0);
-		VGA_sof_debug_video_info();
-	}
-
 	// add the draw event
 	switch (vga.draw.mode) {
 		case DRAWLINE:
 		case EGALINE:
-			if (GCC_UNLIKELY(vga.draw.lines_done < vga.draw.lines_total)) {
-				LOG(LOG_VGAMISC,LOG_NORMAL)( "Lines left: %d", 
-						(int)(vga.draw.lines_total-vga.draw.lines_done));
-				if (vga.draw.mode==EGALINE) PIC_RemoveEvents(VGA_DrawEGASingleLine);
-				else PIC_RemoveEvents(VGA_DrawSingleLine);
-				vga_mode_frames_since_time_base++;
-				RENDER_EndUpdate(true);
-			}
-			vga.draw.lines_done = 0;
 			if (!is_vga_rendering_on_demand) {
 				if (vga.draw.mode==EGALINE)
 					PIC_AddEvent(VGA_DrawEGASingleLine,(float)(vga.draw.delay.htotal/4.0 + draw_skip));
@@ -6722,12 +6983,17 @@ void VGA_CheckScanLength(void) {
 		case M_AMSTRAD: // Next line.
 			if (IS_EGAVGA_ARCH)
 				vga.draw.address_add=vga.config.scan_len*(2u<<vga.config.addr_shift);
+			else if (machine == MCH_3270PC && vga.mode == M_CGA2) // 3270 APA 720x350: linear, scanlines contiguous
+				vga.draw.address_add=vga.draw.blocks*vga.draw.address_line_total;
 			else
 				vga.draw.address_add=vga.draw.blocks;
 			break;
 		case M_CGA4:
 			// 2023/04/26: This path M_CGA2 and M_CGA4 is no longer set for EGA/VGA.
-			vga.draw.address_add=vga.draw.blocks;
+			if (machine == MCH_3270PC) // 3270 APA 360x350: linear, scanlines contiguous
+				vga.draw.address_add=vga.draw.blocks*vga.draw.address_line_total;
+			else
+				vga.draw.address_add=vga.draw.blocks;
 			break;
 		case M_TANDY2:
 			if (machine == MCH_MCGA)
@@ -6815,6 +7081,9 @@ static bool isSVGAMode(void) {
 			return true;
 	}
 
+	if (vga.dosboxig.svga)
+		return true;
+
 	return false;
 }
 
@@ -6833,11 +7102,21 @@ void ChooseRenderOnDemand(void) {
 		vga_render_on_demand = true;
 	else if (machine == MCH_MDA || machine == MCH_HERC) /* I don't believe raster effects are used for MDA and all variants of Hercules cards text or otherwise */
 		vga_render_on_demand = true;
+	else if (vga_render_wait_for_changes > 0) /* NTS: Wait for changes requires render on demand. Only if explicitly enabled. */
+		vga_render_on_demand = true;
 	else
 		vga_render_on_demand = false;
 
+	if (vga_render_on_demand)
+		vga_render_wait_for_changes = vga_render_wait_for_changes_user > 0;
+	else
+		vga_render_wait_for_changes = false;
+
 	LOG(LOG_VGAMISC,LOG_DEBUG)("Render On Demand mode is %s for RodU %d",vga_render_on_demand?"on":"off",vga_render_on_demand_user);
+	LOG(LOG_VGAMISC,LOG_DEBUG)("Wait for changes mode is %s for SrinC %d",vga_render_wait_for_changes?"on":"off",vga_render_wait_for_changes_user);
 }
+
+bool RENDER_IsScalerCompatibleWithDoublescan(void);
 
 void VGA_SetupDrawing(Bitu /*val*/) {
 	if (vga.mode==M_ERROR) {
@@ -6850,7 +7129,10 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 	// multiscan -- zooming effects - only makes sense if linewise is enabled
 	// linewise -- scan display line by line instead of 4 blocks
 	// keep compatibility with other builds of DOSBox for vgaonly.
+	is_vga_rendering_on_demand = vga_render_on_demand;
+	vga.draw.must_complete_frame = true;
 	vga.draw.doublescan_effect = true;
+	vga.draw.must_draw_again = false;
 	vga.draw.render_step = 0;
 	vga.draw.render_max = 1;
 
@@ -7067,7 +7349,7 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 
 		if (vga.dosboxig.svga && vga.dosboxig.width != 0 && vga.dosboxig.height != 0) {
 			htotal = hdend = hbend = hbstart = hrstart = hrend = vga.dosboxig.width;
-			vtotal = vdend = vbend = vbstart = vrstart = vrend = vga.dosboxig.height;
+			vtotal = vdend = vbend = vbstart = vrstart = vrend = vga.dosboxig.height * (1 + vga.dosboxig.vscale);
 			clock = oscclock;
 
 			htotal  += vga.dosboxig.wa_total;
@@ -7130,6 +7412,13 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 			}
 		}
 
+		// Olivetti M24 / AT&T 6300 OGC 640x400: the display controller always produces 400 lines
+		// via the 4-bank interleave once bit0 of the OGC control register is set, regardless of how
+		// the 6845 max-scanline register was programmed (M24-native software often enables it after
+		// setting a plain CGA mode, leaving max_scanline at the CGA value).
+		if (machine == MCH_OLIVETTI && vga.mode == M_DCGA)
+			vga.draw.address_line_total = 4;
+
 		vtotal = vga.draw.address_line_total * (vga.other.vtotal+1u)+vga.other.vadjust;
 		vdend = vga.draw.address_line_total * vga.other.vdend;
 		vrstart = vga.draw.address_line_total * vga.other.vsyncp;
@@ -7164,6 +7453,37 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 					clock=oscclock/9;
 
 				if (vga.herc.mode_control & 0x2) clock /= 2;
+				break;
+			case MCH_OLIVETTI:
+				if (vga.mode == M_DCGA) {
+					// Olivetti M24 / AT&T 6300 640x400 mono: fixed 640-wide, no pixel-doubling.
+					// ponytail: dot clock is a calibration knob — the M24/6300 manuals cite ~25/19/12 MHz
+					//           by mode and ~25 kHz H / ~50-56 Hz V. Tune oscclock if refresh looks off.
+					oscclock = 16000000;
+					clock = oscclock / 8;
+				} else {
+					// standard CGA-compatible modes (digital RGB, no composite)
+					clock = (PIT_TICK_RATE*12)/8;
+					if (vga.mode != M_TANDY2) {
+						if (!(vga.tandy.mode_control & 1)) clock /= 2;
+					}
+					oscclock = clock * 8;
+				}
+				break;
+			case MCH_3270PC:
+				if (vga.mode == M_CGA2 || vga.mode == M_CGA4) {
+					// IBM 3270 PC APA modes (720x350 mono / 360x350 4-color).
+					// ponytail: dot clock is a calibration knob — the 5271 uses 16.257/21.676 MHz crystals.
+					oscclock = 16257000;
+					clock = oscclock / 8;
+				} else {
+					// standard CGA-compatible modes
+					clock = (PIT_TICK_RATE*12)/8;
+					if (vga.mode != M_TANDY2) {
+						if (!(vga.tandy.mode_control & 1)) clock /= 2;
+					}
+					oscclock = clock * 8;
+				}
 				break;
 			default:
 				clock = (PIT_TICK_RATE*12)/8;
@@ -7318,9 +7638,23 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 
 	if (vga.dosboxig.svga) {
 		vga.draw.address_add = vga.dosboxig.bytes_per_scanline;
-		vga.draw.doublescan_effect = true;
-		vga.draw.address_line_total = 1;
+		vga.draw.address_line_total = 1 + vga.dosboxig.vscale;
 		vga.draw.render_max = 1;
+
+		/* if doublescan=false and line_total is even, then halve the height.
+		 * the VGA raster scan will skip every other line to accommodate that. */
+		vga.draw.doublescan_effect = vga.draw.doublescan_set;
+
+		/* If the user selected a scalar that expects to process pixels beyond duplication or CRT emulation, disable doublescan */
+		if (vga.draw.doublescan_effect && !RENDER_IsScalerCompatibleWithDoublescan()) {
+			LOG(LOG_VGA,LOG_DEBUG)("Render scaler requires disabling doublescan mode");
+			vga.draw.doublescan_effect = false;
+		}
+
+		if ((!vga.draw.doublescan_effect) && (vga.draw.address_line_total & 1) == 0)
+			height /= 2;
+		else
+			vga.draw.doublescan_effect = true;
 	}
 	else if (IS_EGAVGA_ARCH || IS_PC98_ARCH) {
 		vga.draw.address_line_total=(vga.crtc.maximum_scan_line&0x1fu)+1u;
@@ -7333,6 +7667,12 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 			case M_TEXT:
 			default:
 				vga.draw.doublescan_effect = vga.draw.doublescan_set;
+
+				/* If the user selected a scalar that expects to process pixels beyond duplication or CRT emulation, disable doublescan */
+				if (vga.draw.doublescan_effect && !RENDER_IsScalerCompatibleWithDoublescan()) {
+					LOG(LOG_VGA,LOG_DEBUG)("Render scaler requires disabling doublescan mode");
+					vga.draw.doublescan_effect = false;
+				}
 
 				if (vga.crtc.maximum_scan_line & 0x80)
 					vga.draw.address_line_total *= 2;
@@ -7407,11 +7747,17 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 		else {
 			switch (vga.mode) {
 				case M_CGA2: // this is used for 1bpp
+					bpp = 32;
 					VGA_DrawLine = VGA_Draw_DOSBOXIG_1bpp;
 					break;
 				case M_PACKED4:
 					bpp = 32;
 					VGA_DrawLine = VGA_Draw_DOSBOXIG_4bpp;
+					break;
+				case M_LIN4:
+				case M_EGA:
+					bpp = 32;
+					VGA_DrawLine = VGA_Draw_DOSBOXIG_1bpp4plane;
 					break;
 				case M_VGA: // 8bpp
 				case M_LIN8:
@@ -7554,6 +7900,15 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 					/* MCGA CGA-compatible modes will always refer to the last half of the 64KB of RAM */
 					vga.tandy.draw_base = vga.mem.linear + 0x8000;
 				}
+				else if (machine == MCH_3270PC) {
+					// IBM 3270 PC APA mode 0x31: 360x350 4-color, LINEAR (90 bytes/line, no interleave)
+					vga.draw.blocks = width;             // 90 bytes -> 360 pixels (4 per byte)
+					vga.tandy.draw_base = vga.mem.linear;
+					vga.tandy.addr_mask = 0x7FFFu;       // 32KB linear framebuffer
+					pix_per_char = 4;                    // width(90)*4 = 360 pixels
+					VGA_DrawLine = VGA_Draw_3270_2BPP_Line;
+					// bpp stays 8 (CGA-indexed via CGA_4_Table)
+				}
 				else {
 					VGA_DrawLine=VGA_Draw_2BPP_Line;
 					VGA_DrawRawLine=VGA_RawDraw_2BPP_Line;
@@ -7561,10 +7916,20 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 				}
 				break;
 			case M_DCGA:
-				// if (IS_EGAVGA_ARCH && J3_IsCga4Dcga()) ...
-				vga.draw.blocks=width;
-				VGA_DrawLine=VGA_Draw_1BPP_Line_as_VGA_J3_Cga4Dcga;
-				bpp = 32;
+				if (machine == MCH_OLIVETTI) {
+					// Olivetti M24 / AT&T 6300 native 640x400 mono. Rendered by the CGA-class 1bpp
+					// scanout; the 4-bank interleave is line_mask=3/line_shift=13 (VGA_SetupOther
+					// defaults) combined with max_scanline=3 programmed by INT10 mode 0x40.
+					vga.draw.blocks=width;
+					VGA_DrawLine=VGA_Draw_1BPP_Line;
+					VGA_DrawRawLine=VGA_RawDraw_1BPP_Line;
+					// bpp stays 8 (CGA-indexed via CGA_2_Table)
+				} else {
+					// if (IS_EGAVGA_ARCH && J3_IsCga4Dcga()) ...
+					vga.draw.blocks=width;
+					VGA_DrawLine=VGA_Draw_1BPP_Line_as_VGA_J3_Cga4Dcga;
+					bpp = 32;
+				}
 				break;
 			case M_CGA2:
 				// CGA 2-color mode on EGA/VGA is just EGA 16-color planar mode with one bitplane enabled and a
@@ -7589,6 +7954,14 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 
 					if (vga.other.mcga_mode_control & 2) // 640x480 2-color
 						vga.draw.address_line_total = 1;
+				}
+				else if (machine == MCH_3270PC) {
+					// IBM 3270 PC APA mode 0x30: 720x350 mono, LINEAR (90 bytes/line, no interleave)
+					vga.draw.blocks = width;             // width=hde=90 -> 90 bytes -> 720 pixels
+					vga.tandy.draw_base = vga.mem.linear;
+					vga.tandy.addr_mask = 0x7FFFu;       // 32KB linear framebuffer
+					VGA_DrawLine = VGA_Draw_3270_1BPP_Line;
+					// bpp stays 8 (CGA-indexed via CGA_2_Table)
 				}
 				else {
 					VGA_DrawLine=VGA_Draw_1BPP_Line;
@@ -7787,7 +8160,13 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 		mcga_double_scan = false;
 	}
 
-	vga.draw.lines_total=height;
+	/* NTS: This code resets line_done. If RENDER_EndUpdate() is not called, misrendering
+	 *      will occur. VGA draw lines_done will be out of sync with render.scale.outLine
+	 *      and the frame will not render properly. */
+	RENDER_EndUpdate(false);
+
+	vga.draw.lines_done = 0;
+	vga.draw.lines_total = height;
 	vga.draw.line_length = width * ((bpp + 1) / 8);
 	vga.draw.oscclock = oscclock;
 	vga.draw.clock = clock;
@@ -7805,6 +8184,16 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 		case MCH_PCJR:
 		case MCH_TANDY:
 			scanfield_ratio = 1.382;
+			break;
+		case MCH_OLIVETTI:
+			// ponytail: M24/6300 monitor is ~4:3; 1.382 (CGA-class) is a close default for both the
+			//           CGA-compatible modes and native 640x400. Tune if the 640x400 aspect looks off.
+			scanfield_ratio = 1.382;
+			break;
+		case MCH_3270PC:
+			// ponytail: 3270 PC 5272 monitor ~4:3; use the MDA/Hercules 720x350-class field ratio for the
+			//           APA modes and CGA-class otherwise. Tune if the APA aspect looks off.
+			scanfield_ratio = (vga.mode == M_CGA2 || vga.mode == M_CGA4) ? 1.535 : 1.382;
 			break;
 		case MCH_MDA:
 		case MCH_HERC:
@@ -7856,8 +8245,16 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 	// calculate screen ratio
 	double screenratio = scanratio * scanfield_ratio;
 
+	// unless DOSBox IG says otherwise, pixels are always square.
+	// the 16:9 HD VESA modes are impossible to display properly otherwise.
+	if (vga.dosboxig.svga) {
+		screenratio = (double)vga.dosboxig.width / (double)vga.dosboxig.height;
+
+		if (vga.dosboxig.dar_width != 0 || vga.dosboxig.dar_height != 0)
+			screenratio = (double)vga.dosboxig.dar_width / (double)vga.dosboxig.dar_height;
+	}
 	// override screenratio for certain cases:
-	if (!IS_PC98_ARCH) {
+	else if (!IS_PC98_ARCH) {
 		if (vratio == 1.6) screenratio = 4.0 / 3.0;
 		else if (vratio == 0.8) screenratio = 4.0 / 3.0;
 		else if (vratio == 3.2) screenratio = 4.0 / 3.0;
@@ -7924,6 +8321,7 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 		}
 	}
 	vga.draw.delay.singleline_delay = (float)vga.draw.delay.htotal;
+	vga.draw.must_complete_frame = true;
 
 	if (machine == MCH_HERC && hercCard == HERC_InColor) {
 		VGA_DAC_UpdateColorPalette();
@@ -7942,7 +8340,6 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 }
 
 void VGA_KillDrawing(void) {
-	is_vga_rendering_on_demand = false;
 	PIC_RemoveEvents(VGA_DrawSingleLine);
 	PIC_RemoveEvents(VGA_DrawEGASingleLine);
 }
@@ -8076,29 +8473,40 @@ void POD_Save_VGA_Draw( std::ostream& stream )
 {
 	uint8_t linear_base_idx;
 	uint8_t font_tables_idx[2];
-	uint8_t drawline_idx;
+	uint8_t drawline_idx = 0u; // fix: was uninitialised; if/else below covers only 14 of ~46 VGA_DrawLine variants, so unmatched modes wrote stack garbage
 
 
 	if(0) {}
 	else if( vga.draw.linear_base == vga.mem.linear ) linear_base_idx = 0;
 	//else if( vga.draw.linear_base == vga.fastmem ) linear_base_idx = 1;
 
-
-	for( int lcv=0; lcv<2; lcv++ ) {
-		if(0) {}
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[0*1024]) ) font_tables_idx[lcv] = 0;
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[8*1024]) ) font_tables_idx[lcv] = 1;
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[16*1024]) ) font_tables_idx[lcv] = 2;
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[24*1024]) ) font_tables_idx[lcv] = 3;
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[32*1024]) ) font_tables_idx[lcv] = 4;
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[40*1024]) ) font_tables_idx[lcv] = 5;
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[48*1024]) ) font_tables_idx[lcv] = 6;
-		else if( vga.draw.font_tables[lcv] == &(vga.draw.font[56*1024]) ) font_tables_idx[lcv] = 7;
+	if (IS_EGAVGA_ARCH) {
+		for( int lcv=0; lcv<2; lcv++ ) {
+			if( vga.draw.font_tables[lcv] == &(vga.mem.linear[0*1024*4 + 2]) ) font_tables_idx[lcv] = 0;
+			else if( vga.draw.font_tables[lcv] == &(vga.mem.linear[8*1024*4 + 2]) ) font_tables_idx[lcv] = 1;
+			else if( vga.draw.font_tables[lcv] == &(vga.mem.linear[16*1024*4 + 2]) ) font_tables_idx[lcv] = 2;
+			else if( vga.draw.font_tables[lcv] == &(vga.mem.linear[24*1024*4 + 2]) ) font_tables_idx[lcv] = 3;
+			else if( vga.draw.font_tables[lcv] == &(vga.mem.linear[32*1024*4 + 2]) ) font_tables_idx[lcv] = 4;
+			else if( vga.draw.font_tables[lcv] == &(vga.mem.linear[40*1024*4 + 2]) ) font_tables_idx[lcv] = 5;
+			else if( vga.draw.font_tables[lcv] == &(vga.mem.linear[48*1024*4 + 2]) ) font_tables_idx[lcv] = 6;
+			else if( vga.draw.font_tables[lcv] == &(vga.mem.linear[56*1024*4 + 2]) ) font_tables_idx[lcv] = 7;
+		}
+	}
+	else {
+		for( int lcv=0; lcv<2; lcv++ ) {
+			if( vga.draw.font_tables[lcv] == &(vga.draw.font[0*1024]) ) font_tables_idx[lcv] = 0;
+			else if( vga.draw.font_tables[lcv] == &(vga.draw.font[8*1024]) ) font_tables_idx[lcv] = 1;
+			else if( vga.draw.font_tables[lcv] == &(vga.draw.font[16*1024]) ) font_tables_idx[lcv] = 2;
+			else if( vga.draw.font_tables[lcv] == &(vga.draw.font[24*1024]) ) font_tables_idx[lcv] = 3;
+			else if( vga.draw.font_tables[lcv] == &(vga.draw.font[32*1024]) ) font_tables_idx[lcv] = 4;
+			else if( vga.draw.font_tables[lcv] == &(vga.draw.font[40*1024]) ) font_tables_idx[lcv] = 5;
+			else if( vga.draw.font_tables[lcv] == &(vga.draw.font[48*1024]) ) font_tables_idx[lcv] = 6;
+			else if( vga.draw.font_tables[lcv] == &(vga.draw.font[56*1024]) ) font_tables_idx[lcv] = 7;
+		}
 	}
 
 
-	if(0) {}
-	else if( VGA_DrawLine == VGA_Draw_1BPP_Line ) drawline_idx = 1;
+	if( VGA_DrawLine == VGA_Draw_1BPP_Line ) drawline_idx = 1;
 	else if( VGA_DrawLine == VGA_Draw_2BPP_Line ) drawline_idx = 3;
 	else if( VGA_DrawLine == VGA_Draw_2BPPHiRes_Line ) drawline_idx = 4;
 	else if( VGA_DrawLine == VGA_Draw_CGA16_Line ) drawline_idx = 5;
@@ -8112,6 +8520,8 @@ void POD_Save_VGA_Draw( std::ostream& stream )
 	else if( VGA_DrawLine == VGA_TEXT_Draw_Line ) drawline_idx = 14;
 	else if( VGA_DrawLine == VGA_TEXT8_Herc_Draw_Line ) drawline_idx = 15;
 	else if( VGA_DrawLine == VGA_TEXT_Xlat32_Draw_Line ) drawline_idx = 17;
+	else if( VGA_DrawLine == VGA_Draw_3270_1BPP_Line ) drawline_idx = 18;
+	else if( VGA_DrawLine == VGA_Draw_3270_2BPP_Line ) drawline_idx = 19;
 
 	//**********************************************
 	//**********************************************
@@ -8134,7 +8544,8 @@ void POD_Save_VGA_Draw( std::ostream& stream )
 
 
 	// - pure data
-	WRITE_POD( &TempLine, TempLine );
+	WRITE_POD( &TempLineSize, TempLineSize );
+	WRITE_POD_SIZE( TempLine, TempLineSize );	
 
 
 	// - system data
@@ -8176,7 +8587,23 @@ void POD_Load_VGA_Draw( std::istream& stream )
 
 
 	// - pure data
-	READ_POD( &TempLine, TempLine );
+	const unsigned int oldTempLineSize = TempLineSize;
+
+	READ_POD( &TempLineSize, TempLineSize );
+
+	if( oldTempLineSize != TempLineSize ) {
+		TempLineFree();
+
+		if(	TempLineAlloc(( TempLineSize - 1024 ) / 4 )) {
+			READ_POD_SIZE( TempLine, TempLineSize );
+		} else {
+			LOG( LOG_VGA, LOG_ERROR )("Savestate load could not allocate TempLine");
+			stream.seekg( TempLineSize, stream.cur );
+		}
+	} else {
+		// read directly into the old address
+		READ_POD_SIZE( TempLine, TempLineSize );
+	}
 
 
 	// - system data
@@ -8198,16 +8625,32 @@ void POD_Load_VGA_Draw( std::istream& stream )
 	}
 
 
-	for( int lcv=0; lcv<2; lcv++ ) {
-		switch( font_tables_idx[lcv] ) {
-			case 0: vga.draw.font_tables[lcv] = &(vga.draw.font[0*1024]); break;
-			case 1: vga.draw.font_tables[lcv] = &(vga.draw.font[8*1024]); break;
-			case 2: vga.draw.font_tables[lcv] = &(vga.draw.font[16*1024]); break;
-			case 3: vga.draw.font_tables[lcv] = &(vga.draw.font[24*1024]); break;
-			case 4: vga.draw.font_tables[lcv] = &(vga.draw.font[32*1024]); break;
-			case 5: vga.draw.font_tables[lcv] = &(vga.draw.font[40*1024]); break;
-			case 6: vga.draw.font_tables[lcv] = &(vga.draw.font[48*1024]); break;
-			case 7: vga.draw.font_tables[lcv] = &(vga.draw.font[56*1024]); break;
+	if (IS_EGAVGA_ARCH) {
+		for( int lcv=0; lcv<2; lcv++ ) {
+			switch( font_tables_idx[lcv] ) {
+				case 0: vga.draw.font_tables[lcv] = &(vga.mem.linear[0*1024*4 + 2]); break;
+				case 1: vga.draw.font_tables[lcv] = &(vga.mem.linear[8*1024*4 + 2]); break;
+				case 2: vga.draw.font_tables[lcv] = &(vga.mem.linear[16*1024*4 + 2]); break;
+				case 3: vga.draw.font_tables[lcv] = &(vga.mem.linear[24*1024*4 + 2]); break;
+				case 4: vga.draw.font_tables[lcv] = &(vga.mem.linear[32*1024*4 + 2]); break;
+				case 5: vga.draw.font_tables[lcv] = &(vga.mem.linear[40*1024*4 + 2]); break;
+				case 6: vga.draw.font_tables[lcv] = &(vga.mem.linear[48*1024*4 + 2]); break;
+				case 7: vga.draw.font_tables[lcv] = &(vga.mem.linear[56*1024*4 + 2]); break;
+			}
+		}
+	}
+	else {
+		for( int lcv=0; lcv<2; lcv++ ) {
+			switch( font_tables_idx[lcv] ) {
+				case 0: vga.draw.font_tables[lcv] = &(vga.draw.font[0*1024]); break;
+				case 1: vga.draw.font_tables[lcv] = &(vga.draw.font[8*1024]); break;
+				case 2: vga.draw.font_tables[lcv] = &(vga.draw.font[16*1024]); break;
+				case 3: vga.draw.font_tables[lcv] = &(vga.draw.font[24*1024]); break;
+				case 4: vga.draw.font_tables[lcv] = &(vga.draw.font[32*1024]); break;
+				case 5: vga.draw.font_tables[lcv] = &(vga.draw.font[40*1024]); break;
+				case 6: vga.draw.font_tables[lcv] = &(vga.draw.font[48*1024]); break;
+				case 7: vga.draw.font_tables[lcv] = &(vga.draw.font[56*1024]); break;
+			}
 		}
 	}
 
@@ -8227,5 +8670,7 @@ void POD_Load_VGA_Draw( std::istream& stream )
 		case 14: VGA_DrawLine = VGA_TEXT_Draw_Line; break;
 		case 15: VGA_DrawLine = VGA_TEXT8_Herc_Draw_Line; break;
 		case 17: VGA_DrawLine = VGA_TEXT_Xlat32_Draw_Line; break;
+		case 18: VGA_DrawLine = VGA_Draw_3270_1BPP_Line; break;
+		case 19: VGA_DrawLine = VGA_Draw_3270_2BPP_Line; break;
 	}
 }

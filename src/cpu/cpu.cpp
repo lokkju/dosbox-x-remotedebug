@@ -1255,9 +1255,11 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
                         guest_msdos_LoL = RealMake(SegValue(es),reg_bx);
                         /* Read off the MCB chain base (WARNING: Only works with MS-DOS 3.3 or later) */
                         guest_msdos_mcb_chain = real_readw(guest_msdos_LoL>>16,(guest_msdos_LoL&0xFFFF)-2);
+                        guest_msdos_dev_chain = RealMake(guest_msdos_LoL>>16,(guest_msdos_LoL&0xFFFF)+0x22);//point to NUL driver header
 #if 1
                         LOG_MSG("List of Lists: %04x:%04x",guest_msdos_LoL>>16,guest_msdos_LoL&0xFFFF);
                         LOG_MSG("MCB chain starts at: %04x",guest_msdos_mcb_chain);
+                        LOG_MSG("DEV chain starts at: %04x:%04x",guest_msdos_dev_chain>>16,guest_msdos_dev_chain&0xFFFFu);
 #endif
                         return;
                     }
@@ -2514,30 +2516,20 @@ static uint32_t snap_cpu_saved_cr4;
  * by the guest OS, but that's something we'll clean up
  * later. */
 void CPU_Snap_Back_To_Real_Mode() {
-    if (snap_cpu_snapped) return;
+	if (snap_cpu_snapped) return;
 
-    SETFLAGBIT(IF,false);	/* forcibly clear interrupt flag */
+	snap_cpu_saved_cr0 = (uint32_t)cpu.cr0;
+	snap_cpu_saved_cr2 = (uint32_t)paging.cr2;
+	snap_cpu_saved_cr3 = (uint32_t)paging.cr3;
+	snap_cpu_saved_cr4 = (uint32_t)cpu.cr4;
+	do_pse = false;
 
-    cpu.code.big = false;   /* force back to 16-bit */
-    cpu.stack.big = false;
-    cpu.stack.mask = 0xffff;
-    cpu.stack.notmask = 0xffff0000;
+	CPU_SET_CRX(0,0);	/* force CPU to real mode */
+	CPU_SET_CRX(2,0);	/* disable paging */
+	CPU_SET_CRX(3,0);	/* clear the page table dir */
+	CPU_SET_CRX(4,0);	/* disable PSE/PAE */
 
-    snap_cpu_saved_cr0 = (uint32_t)cpu.cr0;
-    snap_cpu_saved_cr2 = (uint32_t)paging.cr2;
-    snap_cpu_saved_cr3 = (uint32_t)paging.cr3;
-    snap_cpu_saved_cr4 = (uint32_t)cpu.cr4;
-    do_pse = false;
-
-    CPU_SET_CRX(0,0);	/* force CPU to real mode */
-    CPU_SET_CRX(2,0);	/* disable paging */
-    CPU_SET_CRX(3,0);	/* clear the page table dir */
-    CPU_SET_CRX(4,0);	/* disable PSE/PAE */
-
-    cpu.idt.SetBase(0);         /* or ELSE weird things will happen when INTerrupts are run */
-    cpu.idt.SetLimit(1023);
-
-    snap_cpu_snapped = true;
+	snap_cpu_snapped = true;
 }
 
 void CPU_Snap_Back_Restore() {
@@ -2552,6 +2544,33 @@ void CPU_Snap_Back_Restore() {
 }
 
 void CPU_Snap_Back_Forget() {
+	SETFLAGBIT(IF,false);	/* forcibly clear interrupt flag */
+
+	cpu.code.big = false;   /* force back to 16-bit */
+	cpu.stack.big = false;
+	cpu.stack.mask = 0xffff;
+	cpu.stack.notmask = 0xffff0000;
+
+	cpu.gdt.SetBase(0);
+	cpu.gdt.SetLimit(0xFFFF);
+
+	cpu.idt.SetBase(0);         /* or ELSE weird things will happen when INTerrupts are run */
+	cpu.idt.SetLimit(1023);
+
+	/* reboot from OS/2 causes boot process to fail unless we do this */
+	Segs.limit[cs] = 0xFFFF;
+	Segs.limit[ds] = 0xFFFF;
+	Segs.limit[es] = 0xFFFF;
+	Segs.limit[fs] = 0xFFFF;
+	Segs.limit[gs] = 0xFFFF;
+	Segs.limit[ss] = 0xFFFF;
+	Segs.phys[cs]=(PhysPt)SegValue(cs) << 4u;
+	Segs.phys[ds]=(PhysPt)SegValue(ds) << 4u;
+	Segs.phys[es]=(PhysPt)SegValue(es) << 4u;
+	Segs.phys[fs]=(PhysPt)SegValue(fs) << 4u;
+	Segs.phys[gs]=(PhysPt)SegValue(gs) << 4u;
+	Segs.phys[ss]=(PhysPt)SegValue(ss) << 4u;
+
 	snap_cpu_snapped = false;
 }
 
@@ -4886,6 +4905,36 @@ bool CPU_LDMXCSR(PhysPt eaa) {
 bool CPU_STMXCSR(PhysPt eaa) {
 	mem_writed(eaa,fpu.mxcsr);
 	return true;
+}
+
+bool FPU_CoprocessorException(void) {
+	/* FPU instructions MUST cause exception 7 if these bits are set, or else Windows
+	 * fails to task switch FPU state properly and funny things happen. */
+	if (cpu.cr0&(CR0_FPUEMULATION|CR0_TASKSWITCH)) {
+		cpu.exception.which=EXCEPTION_NM;
+		cpu.exception.error=0;/*No error code field*/
+		return true;
+	}
+
+	return false;
+}
+
+bool MMX_CoprocessorException(void) {
+	/* If EM bit set, undefined code.
+	 * Else if TS set, exception 7 */
+	if (cpu.cr0&CR0_FPUEMULATION) {
+		cpu.exception.which=EXCEPTION_UD;
+		cpu.exception.error=0;/*No error code field*/
+		return true;
+	}
+
+	if (cpu.cr0&CR0_TASKSWITCH) {
+		cpu.exception.which=EXCEPTION_NM;
+		cpu.exception.error=0;/*No error code field*/
+		return true;
+	}
+
+	return false;
 }
 
 namespace
