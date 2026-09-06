@@ -33,17 +33,25 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-/* The largest reply body this stub will emit, and the value it advertises
- * as PacketSize in qSupported. The two must agree: a client is entitled to
- * size its buffers from the advertisement and reject anything longer. */
-static const uint32_t GDB_MAX_PACKET_SIZE = 0x3fff;
+/* The most bytes a single `m` may ask for, and so the ceiling on the length
+ * this stub will honour. Before it existed, an unbounded length from the
+ * wire sized a stack VLA in send_packet and `m0,ffffff` crashed the
+ * emulator.
+ *
+ * A round 8KB rather than a value derived from the packet size: 8192 is
+ * what a client reading in blocks naturally asks for, and deriving the
+ * limit from the old PacketSize=3fff produced 8191, which refused exactly
+ * that request for the sake of one byte. The advertisement is derived from
+ * this instead, which is the right way round -- what the stub will send
+ * decides what it should claim, not the reverse. */
+static const uint32_t GDB_MAX_READ_BYTES = 0x2000;
 
-/* `m` answers two hex digits per byte, so this is the most bytes a single
- * read can return without overrunning the advertised packet size. It is
- * also the ceiling on the length a client may request: before it existed,
- * an unbounded length from the wire sized a stack VLA in send_packet and
- * `m0,ffffff` crashed the emulator. */
-static const uint32_t GDB_MAX_READ_BYTES = GDB_MAX_PACKET_SIZE / 2;
+/* The largest packet this stub will emit, and the value it advertises as
+ * PacketSize in qSupported. A full-size `m` reply is two hex digits per
+ * byte plus the '$', '#' and two checksum digits of the frame. The two must
+ * agree: a client is entitled to size its buffers from the advertisement
+ * and reject anything longer. */
+static const uint32_t GDB_MAX_PACKET_SIZE = GDB_MAX_READ_BYTES * 2 + 4;
 
 // Action requested by GDB client, returned from poll()
 enum class GDBAction {

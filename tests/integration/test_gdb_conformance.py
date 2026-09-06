@@ -554,10 +554,11 @@ def test_no_ack_mode_does_not_survive_a_reconnect(emulator):
 
 # -- `m` must bound the byte count a client can ask for --------------------
 
-# qSupported advertises PacketSize=3fff, so the largest reply body the stub
-# promises to emit is 0x3fff bytes. `m` answers two hex digits per byte, so
-# the most bytes that fit is 0x3fff / 2 == 8191.
-MAX_READ_BYTES = 0x3FFF // 2
+# The most bytes a single `m` will return. The stub derives the PacketSize
+# it advertises from this: two hex digits per byte, plus the four framing
+# characters '$', '#' and the two checksum digits.
+MAX_READ_BYTES = 0x2000
+MAX_PACKET_SIZE = MAX_READ_BYTES * 2 + 4
 
 
 def test_an_oversized_memory_read_does_not_kill_the_emulator(emulator):
@@ -587,8 +588,14 @@ def test_memory_read_is_bounded_by_the_advertised_packet_size(gdb):
         f"a read at exactly the advertised capacity should succeed, got "
         f"{reply[:16]!r}")
     assert len(reply) // 2 == MAX_READ_BYTES
-    assert len(reply) <= 0x3FFF, (
+    assert len(reply) + 4 <= MAX_PACKET_SIZE, (
         f"reply body is {len(reply)} bytes, past the advertised PacketSize")
+
+
+def test_qsupported_advertises_the_packet_size_the_stub_enforces(gdb):
+    """The advertisement and the limit are derived from one constant so they
+    cannot drift; assert the client actually sees the derived value."""
+    assert f"PacketSize={MAX_PACKET_SIZE:x}" in gdb.supported()
 
 
 # -- addresses must not wrap round the top of the address space ------------
