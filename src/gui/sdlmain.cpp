@@ -1516,6 +1516,68 @@ static bool IsFullscreen() {
 bool is_paused = false;
 bool unpause_now = false;
 bool pausewithinterrupts_enable = false;
+
+#if C_REMOTEDEBUG
+#include <atomic>
+static void PauseDOSBoxLoop(Bitu);  // Forward declaration
+void PushDummySDL(void);  // Forward declaration
+static std::atomic<EmulatorControlRequest> pending_control_request{EmulatorControlRequest::NONE};
+
+void EMULATOR_RequestPause() {
+    pending_control_request.store(EmulatorControlRequest::PAUSE);
+}
+
+void EMULATOR_RequestResume() {
+    // Resume can be done directly - just set the flag and push an event
+    if (is_paused) {
+        unpause_now = true;
+        PushDummySDL();
+    }
+}
+
+void EMULATOR_RequestReset(bool dos_only) {
+    pending_control_request.store(dos_only ? EmulatorControlRequest::RESET_DOS : EmulatorControlRequest::RESET);
+}
+
+bool EMULATOR_IsPaused() {
+    return is_paused;
+}
+
+bool EMULATOR_CheckPendingControl() {
+    EmulatorControlRequest req = pending_control_request.exchange(EmulatorControlRequest::NONE);
+    if (req == EmulatorControlRequest::NONE) {
+        return false;
+    }
+
+    switch (req) {
+        case EmulatorControlRequest::PAUSE:
+            if (!is_paused) {
+                PIC_AddEvent(PauseDOSBoxLoop, 0.001);
+            }
+            break;
+        case EmulatorControlRequest::RESUME:
+            // Already handled in EMULATOR_RequestResume
+            break;
+        case EmulatorControlRequest::RESET:
+            if (is_paused) {
+                is_paused = false;
+                mainMenu.get_item("mapper_pause").check(false).refresh_item(mainMenu);
+            }
+            throw int(3);  // Full system reboot
+            break;
+        case EmulatorControlRequest::RESET_DOS:
+            if (is_paused) {
+                is_paused = false;
+                mainMenu.get_item("mapper_pause").check(false).refresh_item(mainMenu);
+            }
+            throw int(6);  // DOS kernel reboot only
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+#endif
 #if DOSBOXMENU_TYPE == DOSBOXMENU_NSMENU
 int pause_menu_item_tag = -1;
 #endif

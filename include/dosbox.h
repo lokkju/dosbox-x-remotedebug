@@ -334,6 +334,16 @@ bool CheckPreventCap(void);
 void ApplyPreventCap(void);
 void ApplyPreventCapMenu(void);
 
+#if C_REMOTEDEBUG
+// Emulator control API for QMP
+enum class EmulatorControlRequest { NONE, PAUSE, RESUME, RESET, RESET_DOS };
+void EMULATOR_RequestPause();
+void EMULATOR_RequestResume();
+void EMULATOR_RequestReset(bool dos_only = false);
+bool EMULATOR_IsPaused();
+bool EMULATOR_CheckPendingControl();
+#endif
+
 #endif /* DOSBOX_DOSBOX_H */
 
 #ifndef SAVE_STATE_H_INCLUDED
@@ -488,6 +498,15 @@ void readString(std::istream& stream, std::string& data)
     stream.read(&data[0], stringSize * sizeof(std::string::value_type));
 }
 #endif //SAVE_STATE_H_INCLUDED
+
+#if C_REMOTEDEBUG
+// Async save/load state API for QMP
+void SAVESTATE_RequestSave(const std::string& filepath);
+void SAVESTATE_RequestLoad(const std::string& filepath);
+bool SAVESTATE_IsPending();
+bool SAVESTATE_IsComplete(std::string& error_out);
+bool SAVESTATE_CheckPendingRequest();
+#endif
 
 #if defined (WIN32)
 int _wmkdir_p(const wchar_t *pathname);

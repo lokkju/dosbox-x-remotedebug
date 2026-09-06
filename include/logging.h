@@ -33,6 +33,7 @@ enum LOG_TYPES {
 	LOG_IO,
 	LOG_PCI,
 	LOG_VOODOO,
+	LOG_REMOTE,
 	LOG_MAX
 };
 

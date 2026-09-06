@@ -53,6 +53,9 @@
 #include <unistd.h>
 #include "dosbox.h"
 #include "debug.h"
+#if C_REMOTEDEBUG
+#include "qmp.h"
+#endif
 #include "cpu.h"
 #include "logging.h"
 #include "menudef.h"
@@ -466,6 +469,27 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
+#if C_REMOTEDEBUG
+            // Check for GDB step/continue requests from the GDB server thread
+            if (DEBUG_CheckGDBStep()) {
+                /* Halted for GDB, or a step just completed. The drains below
+                 * are unreachable on this path, so pending QMP work has to be
+                 * serviced here or it never runs while stopped at a
+                 * breakpoint: savestate waits out its timeout and queued
+                 * keystrokes are dropped. */
+                SAVESTATE_CheckPendingRequest();
+                EMULATOR_CheckPendingControl();
+                QMP_ProcessPendingInputEvents();
+                // Step was executed, return to allow loop to be called again
+                return 0;
+            }
+            // Check for save/load state requests from QMP
+            SAVESTATE_CheckPendingRequest();
+            // Check for emulator control requests from QMP (pause/reset)
+            EMULATOR_CheckPendingControl();
+            // Process pending QMP input events (keyboard, mouse) - thread-safe queue
+            QMP_ProcessPendingInputEvents();
+#endif
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();
@@ -1758,6 +1782,20 @@ void DOSBOX_SetupConfigSections(void) {
 
     Pbool = secprop->Add_bool("bochs debug port e9",Property::Changeable::WhenIdle,false);
     Pbool->Set_help("If set, emulate Bochs debug port E9h. ASCII text written to this I/O port is assumed to be debug output, and logged.");
+
+#if C_REMOTEDEBUG
+    Pbool = secprop->Add_bool("gdbserver",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("If set, start a GDB remote debugging server. Allows external debuggers to connect.");
+
+    Pint = secprop->Add_int("gdbserver port",Property::Changeable::OnlyAtStart,2159);
+    Pint->Set_help("TCP port for the GDB server to listen on.");
+
+    Pbool = secprop->Add_bool("qmpserver",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("If set, start a QMP (QEMU Monitor Protocol) server for keyboard input injection.");
+
+    Pint = secprop->Add_int("qmpserver port",Property::Changeable::OnlyAtStart,4444);
+    Pint->Set_help("TCP port for the QMP server to listen on.");
+#endif
 
     Pstring = secprop->Add_string("machine",Property::Changeable::OnlyAtStart,"svga_s3");
     Pstring->Set_values(machines);

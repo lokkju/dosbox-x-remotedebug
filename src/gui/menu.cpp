@@ -873,6 +873,11 @@ static const char* def_menu_debug[] =
     "debug_logint21",
     "debug_logfileio",
 #endif
+#if C_REMOTEDEBUG
+    "--",
+    "debug_gdbserver",
+    "debug_qmpserver",
+#endif
     NULL
 };
 #elif !defined(MACOSX) && !defined(LINUX) && !defined(HX_DOS) && !defined(C_EMSCRIPTEN)

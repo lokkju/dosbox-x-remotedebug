@@ -43,6 +43,10 @@ using namespace std;
 #include "mapper.h"
 #include "pc98_gdc.h"
 #include "callback.h"
+#if C_REMOTEDEBUG
+#include "gdbserver.h"
+#include "qmp.h"
+#endif
 #include "inout.h"
 #include "paging.h"
 #include "shell.h"
@@ -173,6 +177,12 @@ static void OutputVecTable(char* filename);
 static void DrawVariables(void);
 static void LogDOSKernMem(void);
 static void LogBIOSMem(void);
+
+#if C_REMOTEDEBUG
+static GDBServer* gdbServer = nullptr;
+static bool gdb_break_on_exec = false;  // Flag for GDB-aware program execution
+static bool gdb_cpu_paused = false;     // CPU paused waiting for GDB command
+#endif
 
 extern int debuggerrun;
 int debugrunmode=0;
@@ -409,7 +419,7 @@ static char* F80ToString(int regIndex, char* dest) {
 #else
 	snprintf(dest, 11, "%08.2f", fpu.regs[regIndex].d);
 #endif
-	
+
 	return dest;
 }
 
@@ -417,7 +427,7 @@ static bool F80TestUpdate(int regIndex) {
 	if(fpu.sw.top != oldfpu.sw.top) { /* If the top changed then all registers rotated places, thus updated. */
 		return true;
 	}
-	
+
 #if C_FPU_X86
 	return !(fpu.p_regs[regIndex].m1 == oldfpu.p_regs[regIndex].m1 && fpu.p_regs[regIndex].m2 == oldfpu.p_regs[regIndex].m2 && fpu.p_regs[regIndex].m3 == oldfpu.p_regs[regIndex].m3);
 #elif defined(HAS_LONG_DOUBLE)
@@ -628,7 +638,7 @@ public:
 	void					SetOnce			(bool _once)				{ once = _once; };
 	void					SetType			(EBreakpoint _type)			{ type = _type; };
 	void					SetValue		(uint8_t value)				{ ahValue = value; };
-	void					SetOther		(uint8_t other)				{ alValue = other; };	
+	void					SetOther		(uint8_t other)				{ alValue = other; };
 
 	bool					IsActive		(void)						{ return active; };
 	void					Activate		(bool _active);
@@ -832,7 +842,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 					if (desc.GetLimit()==0) return false;
 				}
 
-				Bitu address; 
+				Bitu address;
 				if (bp->GetType()==BKPNT_MEMORY_LINEAR) address = bp->GetOffset();
 				else address = (Bitu)GetAddress(bp->GetSegment(),bp->GetOffset());
 				uint8_t value=0;
@@ -978,7 +988,16 @@ void CBreakpoint::ShowList(void)
 	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
 		CBreakpoint* bp = (*i);
 		if (bp->GetType()==BKPNT_PHYSICAL) {
-			DEBUG_ShowMsg("%02X. BP %04X:%04X\n",nr,bp->GetSegment(),bp->GetOffset());
+			/* A breakpoint set via the GDB stub's Z0 (DEBUG_SetBreakpoint)
+			 * stores segment 0 and the full linear address as the offset,
+			 * so "%04X:%04X" would print e.g. "0000:30000" -- an offset
+			 * wider than every other entry's 16-bit field. Display only;
+			 * what is stored and matched is unchanged. */
+			if (bp->GetSegment()==0 && bp->GetOffset()>0xFFFF) {
+				DEBUG_ShowMsg("%02X. BP %08X (linear)\n",nr,bp->GetOffset());
+			} else {
+				DEBUG_ShowMsg("%02X. BP %04X:%04X\n",nr,bp->GetSegment(),bp->GetOffset());
+			}
 		} else if (bp->GetType()==BKPNT_INTERRUPT) {
 			if (bp->GetValue()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X\n",nr,bp->GetIntNr());
 			else if (bp->GetOther()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X AH=%02X\n",nr,bp->GetIntNr(),bp->GetValue());
@@ -1040,7 +1059,7 @@ static bool StepOver()
 		DrawCode();
 		mainMenu.get_item("mapper_debugger").check(false).refresh_item(mainMenu);
 		return true;
-	} 
+	}
 	return false;
 }
 
@@ -1070,7 +1089,7 @@ static void DrawData(void) {
 	uint64_t address;
 	int w,h,y;
 
-	/* Data win */	
+	/* Data win */
 	getmaxyx(dbg.win_data,h,w);
 
 	if ((paging.enabled || cpu.pmode) && dbg.data_view != DBGBlock::DATV_PHYSICAL) h--;
@@ -1189,7 +1208,7 @@ void DrawRegistersUpdateOld(void) {
 	oldsegs[gs].val=SegValue(gs);
 	oldsegs[ss].val=SegValue(ss);
 	oldsegs[cs].val=SegValue(cs);
-	
+
 	oldfpu = fpu; /* Slow? */
 
 	/*Individual flags*/
@@ -1201,6 +1220,7 @@ void DrawRegistersUpdateOld(void) {
 extern bool do_pse;
 
 bool CPU_IsHLTed(void);
+void CPU_ExitHLT(void);
 
 static void DrawRegisters(void) {
 	if (dbg.win_main == NULL || dbg.win_reg == NULL)
@@ -1224,17 +1244,17 @@ static void DrawRegisters(void) {
 	SetColor(SegValue(gs)!=oldsegs[gs].val);mvwprintw (dbg.win_reg,0,61,"%04X",SegValue(gs));
 	SetColor(SegValue(ss)!=oldsegs[ss].val);mvwprintw (dbg.win_reg,0,71,"%04X",SegValue(ss));
 	SetColor(SegValue(cs)!=oldsegs[cs].val);mvwprintw (dbg.win_reg,1,31,"%04X",SegValue(cs));
-	
+
 	char x87buf[12] = {};
 	SetColor(F80TestUpdate(STV(0)));mvwprintw (dbg.win_reg,4,4,"%s", F80ToString(STV(0), x87buf));
 	SetColor(F80TestUpdate(STV(4)));mvwprintw (dbg.win_reg,5,4,"%s", F80ToString(STV(4), x87buf));
-	
+
 	SetColor(F80TestUpdate(STV(1)));mvwprintw (dbg.win_reg,4,18,"%s", F80ToString(STV(1), x87buf));
 	SetColor(F80TestUpdate(STV(5)));mvwprintw (dbg.win_reg,5,18,"%s", F80ToString(STV(5), x87buf));
-	
+
 	SetColor(F80TestUpdate(STV(2)));mvwprintw (dbg.win_reg,4,32,"%s", F80ToString(STV(2), x87buf));
 	SetColor(F80TestUpdate(STV(6)));mvwprintw (dbg.win_reg,5,32,"%s", F80ToString(STV(6), x87buf));
-	
+
 	SetColor(F80TestUpdate(STV(3)));mvwprintw (dbg.win_reg,4,46,"%s", F80ToString(STV(3), x87buf));
 	SetColor(F80TestUpdate(STV(7)));mvwprintw (dbg.win_reg,5,46,"%s", F80ToString(STV(7), x87buf));
 
@@ -1352,7 +1372,7 @@ static void DrawInput(void) {
         mvwchgat(dbg.win_inp,10,0,3,0,(PAIR_BLACK_GREY),NULL);
         if (*curPtr) {
             mvwchgat(dbg.win_inp,0,(int)(curPtr-dispPtr+4),1,0,(PAIR_BLACK_GREY),NULL);
-        } 
+        }
     }
 
     wattrset(dbg.win_inp,0);
@@ -1428,7 +1448,7 @@ static void DrawCode(void) {
 		mvwprintw(dbg.win_code,i,0,"%04X:%08X ",codeViewData.useCS,disEIP);
 
 		if (drawsize>10) { toolarge = true; drawsize = 9; }
- 
+
         if (start != mem_no_address) {
             for (Bitu c=0;c<drawsize;c++) {
                 uint8_t value;
@@ -2415,7 +2435,7 @@ bool ParseCommand(char* str) {
         DEBUG_ShowMsg("%s",cpptmp.c_str());
         return true;
     }
-	
+
 	if (command == "ADDLOG") {
 		if(found && *found)	DEBUG_ShowMsg("NOTICE: %s\n",found);
 		return true;
@@ -2647,7 +2667,7 @@ bool ParseCommand(char* str) {
         DEBUG_EndPagedContent();
 		return true;
 	}
-    
+
     if (command == "FM") { // Freeze memory value at address
 		uint16_t seg = (uint16_t)GetHexValue(found,found);found++; // skip ":"
 		uint32_t ofs = GetHexValue(found,found);
@@ -2655,7 +2675,7 @@ bool ParseCommand(char* str) {
 		CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(seg,ofs);
         Bitu address = (Bitu)GetAddress(bp->GetSegment(),bp->GetOffset());
 		mem_readb_checked((PhysPt)address,&value);
-        if (bp){ 
+        if (bp){
             bp->SetType(BKPNT_MEMORY_FREEZE);
             bp->SetValue(value);
         }
@@ -2664,7 +2684,7 @@ bool ParseCommand(char* str) {
 	}
 
 	if (command == "BPDEL") { // Delete Breakpoints
-		uint8_t bpNr	= (uint8_t)GetHexValue(found,found); 
+		uint8_t bpNr	= (uint8_t)GetHexValue(found,found);
 		if ((bpNr==0x00) && (*found=='*')) { // Delete all
 			CBreakpoint::DeleteAll();
 			Clear_SYSENTER_Debug();
@@ -2702,7 +2722,7 @@ bool ParseCommand(char* str) {
 		mainMenu.get_item("debugger_runnormal").check(true).refresh_item(mainMenu);
 		mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
 
-		DOSBOX_SetNormalLoop();	
+		DOSBOX_SetNormalLoop();
 		GFX_SetTitle(-1,-1,-1,is_paused);
 		return true;
 	}
@@ -2871,7 +2891,7 @@ bool ParseCommand(char* str) {
 
 		debugging = false;
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
-		DOSBOX_SetNormalLoop();	
+		DOSBOX_SetNormalLoop();
 		return true;
 	}
 
@@ -3980,7 +4000,7 @@ bool ParseCommand(char* str) {
 	}
 
 	if(command == "TIMERIRQ") { //Start a timer irq
-		DEBUG_RaiseTimerIrq(); 
+		DEBUG_RaiseTimerIrq();
 		DEBUG_ShowMsg("Debug: Timer Int started.\n");
 		return true;
 	}
@@ -4292,7 +4312,7 @@ char* AnalyzeInstruction(char* inst, bool saveSelector) {
 		case 'M' :	{	jmp = true; // JMP
 					}	break;
 		case 'N' :	{	switch (instu[2]) {
-						case 'B' :	
+						case 'B' :
 						case 'C' :	{	jmp = get_CF()?false:true;	// JNB / JNC
 									}	break;
 						case 'E' :	{	jmp = get_ZF()?false:true;	// JNE
@@ -4505,15 +4525,10 @@ static int dbg_getch_vt(void) {
 }
 #endif
 
-uint32_t DEBUG_CheckKeys(void) {
+uint32_t DEBUG_CheckKeys(int key) {
 	Bits ret=0;
 	bool numberrun = false;
 	bool skipDraw = false;
-#ifdef WIN32
-	int key=dbg_getch_vt();
-#else
-	int key=getch();
-#endif
 
     if (key == KEY_RESIZE) {
 #ifdef WIN32 /* BUG: pdcurses notifies us immediately upon getting a resize event but does not update it's
@@ -4541,7 +4556,7 @@ uint32_t DEBUG_CheckKeys(void) {
         DEBUG_DrawScreen();
         return 0;
     }
-	
+
 	if (key >='0' && key <='5' && strlen(codeViewData.inputStr) == 0) {
 		const int32_t v[] ={1,5,500,1000,5000,10000};
 
@@ -4701,7 +4716,7 @@ uint32_t DEBUG_CheckKeys(void) {
                         break;
                 }
                 break;
-        case KEY_UP:	// up 
+        case KEY_UP:	// up
                 switch (dbg.active_win) {
                     case DBGBlock::WINI_CODE:
                         win_code_ui_up(1);
@@ -4870,7 +4885,7 @@ uint32_t DEBUG_CheckKeys(void) {
 				break;
 		case KEY_BACKSPACE: //backspace (linux)
 		case 0x7f:	// backspace in some terminal emulators (linux)
-		case 0x08:	// delete 
+		case 0x08:	// delete
 				if (codeViewData.inputPos == 0) break;
 				codeViewData.inputPos--;
 				// fallthrough
@@ -4905,7 +4920,7 @@ uint32_t DEBUG_CheckKeys(void) {
 		}
 		if (ret<0) return (uint32_t)ret;
 		if (ret>0) {
-			if (GCC_UNLIKELY(ret >= (Bits)CB_MAX)) 
+			if (GCC_UNLIKELY(ret >= (Bits)CB_MAX))
 				ret = 0;
 			else
 				ret = (Bits)(*CallBack_Handlers[ret])();
@@ -5025,7 +5040,11 @@ Bitu DEBUG_Loop(void) {
             DEBUG_RefreshPage(0);
         }
 
-    	return DEBUG_CheckKeys();
+#ifdef WIN32
+    	return DEBUG_CheckKeys(dbg_getch_vt());
+#else
+    	return DEBUG_CheckKeys(getch());
+#endif
     }
 }
 
@@ -5041,6 +5060,28 @@ static bool hidedebugger=false;
 void DEBUG_Enable_Handler(bool pressed) {
 	if (!pressed || control->opt_display2)
 		return;
+
+#if C_REMOTEDEBUG
+    // Check for mutual exclusion with GDB client
+    if (gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
+        // GDB client is connected - notify it about the breakpoint/stop
+        // This handles both breakpoint hits and user-initiated debug breaks
+        if (!debugging) {
+            LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: Breakpoint hit - signaling to GDB client");
+            gdbServer->send_stop_reply(5);  // SIGTRAP
+            gdb_cpu_paused = true;  // Pause CPU until GDB sends continue/step
+            // Clear the GDB break on exec flag if it was set
+            if (gdb_break_on_exec) {
+                gdb_break_on_exec = false;
+            }
+        } else {
+            LOG(LOG_REMOTE, LOG_WARN)("DEBUG: Interactive debugger blocked - GDB client is connected");
+            DEBUG_ShowMsg("Interactive debugger unavailable: GDB client is connected.\n");
+            DEBUG_ShowMsg("Disconnect GDB client first, or use GDB for debugging.\n");
+        }
+        return;
+    }
+#endif
 
     if (hidedebugger) {
         hidedebugger=false;
@@ -5083,7 +5124,7 @@ void DEBUG_Enable_Handler(bool pressed) {
         DEBUG_DrawScreen();
 
         CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
-        DOSBOX_SetNormalLoop();	
+        DOSBOX_SetNormalLoop();
         GFX_SetTitle(-1,-1,-1,is_paused);
 //      if (tohide) return;
     }
@@ -5116,6 +5157,10 @@ void DEBUG_Enable_Handler(bool pressed) {
 
     LoopHandler *ol = DOSBOX_GetLoop();
     if (ol != DEBUG_Loop) old_loop = ol;
+
+    if (!debugging) {
+        printf("Breakpoint hit! Entering debugger.\n");
+    }
 
     debugging=true;
     debug_running=false;
@@ -5817,6 +5862,15 @@ void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off)
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
         debugger_break_on_exec = false;
     }
+#  if C_REMOTEDEBUG
+    // GDB-aware break on exec (from QMP debug-execute)
+    if (gdb_break_on_exec) {
+        LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: GDB break on exec at %04X:%08X", seg, off);
+		CBreakpoint::AddBreakpoint(seg,off,true);
+		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
+        // Note: gdb_break_on_exec is cleared when breakpoint is hit
+    }
+#  endif
 # endif
 #endif
 #if 0
@@ -5876,7 +5930,7 @@ void DEBUG_SetupConsole(void) {
 		WIN32_Console();
 #else
 		tcgetattr(0,&consolesettings);
-#endif	
+#endif
 		//	dbg.active_win=3;
 		/* Start the Debug Gui */
 		DBGUI_StartUp();
@@ -5912,10 +5966,34 @@ void DEBUG_ReinitCallback(void) {
 	CALLBACK_Setup(debugCallback,DEBUG_EnableDebugger,CB_RETF,"debugger");
 }
 
+#if C_REMOTEDEBUG
+extern void UpdateRemoteDebugMenuCheckmarks();
+#endif
+
 void DEBUG_Init() {
     LOG(LOG_MISC, LOG_DEBUG)("Initializing debug system");
 
-	/* Reset code overview and input line */
+#if C_REMOTEDEBUG
+    /* Check config for GDB server and QMP server */
+    Section_prop *section = static_cast<Section_prop*>(control->GetSection("dosbox"));
+    if (section) {
+        bool gdbserver_enabled = section->Get_bool("gdbserver");
+        int gdbserver_port = section->Get_int("gdbserver port");
+        if (gdbserver_enabled) {
+            DEBUG_StartGDBServer(gdbserver_port);
+        }
+
+        bool qmp_enabled = section->Get_bool("qmpserver");
+        int qmp_port = section->Get_int("qmpserver port");
+        if (qmp_enabled) {
+            DEBUG_StartQMPServer(qmp_port);
+        }
+    }
+    /* Update menu checkmarks to reflect server state */
+    UpdateRemoteDebugMenuCheckmarks();
+#endif
+
+    /* Reset code overview and input line */
 	memset((void*)&codeViewData,0,sizeof(codeViewData));
 	/* Setup callback */
 	debugCallback=CALLBACK_Allocate();
@@ -6064,6 +6142,23 @@ static void SaveMemoryBin(uint16_t seg, uint32_t ofs1, uint32_t num) {
 
 	fclose(f);
 	DEBUG_ShowMsg("DEBUG: Memory dump binary success.\n");
+}
+
+// Public API for memory dump - used by QMP server
+bool DEBUG_SaveMemoryBin(const char* filepath, uint32_t address, uint32_t size) {
+	FILE* f = fopen(filepath, "wb");
+	if (!f) {
+		return false;
+	}
+
+	for (uint32_t x = 0; x < size; x++) {
+		uint8_t val;
+		if (mem_readb_checked((PhysPt)(address + x), &val)) val = 0;
+		fwrite(&val, 1, 1, f);
+	}
+
+	fclose(f);
+	return true;
 }
 
 static void OutputVecTable(char* filename) {
@@ -6313,6 +6408,313 @@ void DEBUG_StopLog(void) {
 }
 
 #endif // HEAVY DEBUG
+
+uint32_t DEBUG_GetRegister(int reg) {
+     switch(reg) {
+         case 0: return reg_eax;
+         case 1: return reg_ecx;
+         case 2: return reg_edx;
+         case 3: return reg_ebx;
+         case 4: return reg_esp;
+         case 5: return reg_ebp;
+         case 6: return reg_esi;
+         case 7: return reg_edi;
+         /* RSP register 8 is EIP -- an offset within CS, not a linear
+          * address. This used to return SegPhys(cs) + reg_eip, which made
+          * real gdb display a wrong $pc and made a g/G round-trip corrupt
+          * EIP, because DEBUG_SetRegister(8) has always written reg_eip.
+          * Clients wanting the linear PC compute cs * 16 + eip. */
+         case 8: return reg_eip;
+         case 9: return reg_flags;
+         case 10: return SegValue(cs);
+         case 11: return SegValue(ss);
+         case 12: return SegValue(ds);
+         case 13: return SegValue(es);
+         case 14: return SegValue(fs);
+         case 15: return SegValue(gs);
+         default: return 0;
+     }
+ }
+
+ void DEBUG_SetRegister(int reg, uint32_t value) {
+     switch(reg) {
+         case 0: reg_eax = value; break;
+         case 1: reg_ecx = value; break;
+         case 2: reg_edx = value; break;
+         case 3: reg_ebx = value; break;
+         case 4: reg_esp = value; break;
+         case 5: reg_ebp = value; break;
+         case 6: reg_esi = value; break;
+         case 7: reg_edi = value; break;
+         case 8: reg_eip = value; break;
+         case 9: reg_flags = value; break;
+         case 10: SegSet16(cs, value); break;
+         case 11: SegSet16(ss, value); break;
+         case 12: SegSet16(ds, value); break;
+         case 13: SegSet16(es, value); break;
+         case 14: SegSet16(fs, value); break;
+         case 15: SegSet16(gs, value); break;
+     }
+ }
+
+ bool DEBUG_ReadMemory(uint32_t address, uint8_t *value) {
+     /* mem_readb_checked returns TRUE on failure. Swallowing that and
+      * returning 0 made an unreadable byte indistinguishable from a byte
+      * that happens to be zero, so a client scanning memory could not tell
+      * where readable memory ends. Report the failure and let the caller
+      * decide. */
+     return !mem_readb_checked(address, value);
+ }
+
+ bool DEBUG_WriteMemory(uint32_t address, uint8_t value) {
+     /* mem_writeb_checked returns TRUE on failure. Discarding it reported
+      * success for writes that never landed, which is worse than the read
+      * case: the client believes it changed guest state. */
+     return !mem_writeb_checked(address, value);
+ }
+
+ void DEBUG_Step() {
+    // Interactive debugger path - simulate F11 keypress
+    DEBUG_CheckKeys(KEY_F(11));
+ }
+
+ void DEBUG_Continue() {
+    // Interactive debugger path - simulate F5 keypress
+    DEBUG_CheckKeys(KEY_F(5));
+ }
+
+#if C_REMOTEDEBUG
+ // Called by the main loop to check and handle GDB commands.
+ // Polls the GDB server (non-blocking) and processes any received commands.
+ // Returns true if CPU should be paused (caller should return from loop iteration).
+ bool DEBUG_CheckGDBStep() {
+    if (gdbServer == nullptr || !gdbServer->is_running()) {
+        return false;
+    }
+
+    // Poll for incoming GDB commands (non-blocking)
+    GDBAction action = gdbServer->poll();
+
+    switch (action) {
+        case GDBAction::STEP: {
+            LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB step request");
+            uint32_t eip_before = DEBUG_GetRegister(8);
+
+            // If CPU is in HLT state, force exit from it
+            if (CPU_IsHLTed()) {
+                CPU_ExitHLT();
+            }
+
+            // Execute exactly one instruction
+            skipFirstInstruction = true;
+            mustCompleteInstruction = true;
+            DEBUG_Run(1, true);
+            mustCompleteInstruction = false;
+
+            uint32_t eip_after = DEBUG_GetRegister(8);
+            LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: Step completed, EIP=0x%X->0x%X", eip_before, eip_after);
+
+            // Send stop reply to GDB
+            gdbServer->send_stop_reply(5);  // SIGTRAP
+            gdb_cpu_paused = true;
+            return true;  // CPU should pause
+        }
+
+        case GDBAction::CONTINUE:
+            LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: GDB continue request");
+            CBreakpoint::ActivateBreakpoints();
+            gdb_cpu_paused = false;
+            return false;  // Continue normal execution
+
+        case GDBAction::STOP:
+            LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB stop request");
+            gdb_cpu_paused = true;
+            return true;  // CPU should pause
+
+        case GDBAction::DISCONNECT:
+            LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB client disconnected");
+            gdb_cpu_paused = false;
+            return false;
+
+        case GDBAction::NONE:
+        default:
+            // If paused waiting for GDB command, keep paused
+            if (gdb_cpu_paused && gdbServer->has_client()) {
+                return true;
+            }
+            return false;
+    }
+ }
+#endif
+
+ /* The GDB remote serial protocol's Z0/z0 address is LINEAR, the same as the
+  * m and M packets. CBreakpoint, however, stores a segment:offset pair and
+  * resolves it with GetAddress(seg, off), and GetAddress() masks the offset
+  * to 16 bits whenever the segment is a 16-bit one -- which in real mode is
+  * always. So a linear address cannot be handed over as (0, address):
+  * 0x30000 would be truncated to 0x0000 and the breakpoint would answer OK
+  * and fire at the wrong place, or never.
+  *
+  * Split it instead, so the offset always fits in 16 bits and
+  * GetAddress(seg, off) reproduces the linear address exactly. Below 1 MB
+  * that is (address >> 4, address & 0xF); the HMA (0x100000..0x10FFEF, live
+  * whenever A20 is on) does not fit that form because the segment field is
+  * only 16 bits, so it is expressed against segment 0xFFFF with an offset up
+  * to 0xFFEF.
+  *
+  * This used to split the argument as a far pointer with FP_SEG(x) = x >> 16.
+  * Any breakpoint above 0x10000 answered OK and never fired; below 0x10000
+  * the two interpretations coincide, which is why it looked like it worked.
+  *
+  * In protected mode (cpu.pmode && !(reg_flags & FLAG_VM)) a linear address
+  * has no segment:offset form to fall back on -- GetAddress() would route
+  * through LinMakeProt() and treat the segment as a selector. Rather than
+  * lie about it, refuse outright so the caller sends E01. Protected-mode
+  * breakpoints are NOT implemented here -- this only stops the stub from
+  * claiming success for one it silently dropped. Real-mode behaviour (the
+  * case above) is unchanged. */
+
+ /* Highest linear address expressible as a real-mode segment:offset pair. */
+ #define GDB_BP_MAX_LINEAR 0x10FFEFu
+
+ static bool GDBSplitLinear(uint32_t address, uint16_t* seg, uint32_t* off) {
+     if (address > GDB_BP_MAX_LINEAR) return false;
+     uint32_t s = address >> 4;
+     if (s > 0xFFFFu) s = 0xFFFFu;
+     *seg = (uint16_t)s;
+     *off = address - (s << 4);
+     return true;
+ }
+
+ bool DEBUG_SetBreakpoint(uint32_t address) {
+     if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+         DEBUG_ShowMsg("Refusing breakpoint at linear %x: protected mode is not supported", address);
+         return false;
+     }
+     uint16_t seg; uint32_t off;
+     if (!GDBSplitLinear(address, &seg, &off)) {
+         DEBUG_ShowMsg("Refusing breakpoint at linear %x: outside real-mode addressable memory", address);
+         return false;
+     }
+     DEBUG_ShowMsg("Adding Breakpoint at linear %x (%04X:%04X)", address, seg, off);
+     return CBreakpoint::AddBreakpoint(seg, off, false) != NULL;
+ }
+
+ bool DEBUG_RemoveBreakpoint(uint32_t address) {
+     if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+         DEBUG_ShowMsg("Refusing to remove breakpoint at linear %x: protected mode is not supported", address);
+         return false;
+     }
+     uint16_t seg; uint32_t off;
+     if (!GDBSplitLinear(address, &seg, &off)) {
+         DEBUG_ShowMsg("Refusing to remove breakpoint at linear %x: outside real-mode addressable memory", address);
+         return false;
+     }
+     DEBUG_ShowMsg("Removing Breakpoint at linear %x (%04X:%04X)", address, seg, off);
+     return CBreakpoint::DeleteBreakpoint(seg, off);
+ }
+
+#if C_REMOTEDEBUG
+ // GDB server start/stop functions
+ void DEBUG_StartGDBServer(int port) {
+     if (gdbServer != nullptr && gdbServer->is_running()) {
+         DEBUG_ShowMsg("GDBServer: Already running");
+         return;
+     }
+
+     if (gdbServer != nullptr) {
+         delete gdbServer;
+     }
+
+     gdbServer = new GDBServer(port);
+     gdbServer->start();
+ }
+
+ void DEBUG_StopGDBServer() {
+     if (gdbServer != nullptr) {
+         gdbServer->stop();  // This now waits for thread to finish
+         delete gdbServer;
+         gdbServer = nullptr;
+     }
+ }
+
+ bool DEBUG_IsGDBServerRunning() {
+     return gdbServer != nullptr && gdbServer->is_running();
+ }
+
+ void DEBUG_StartQMPServer(int port) {
+     QMP_StartServer(port);
+ }
+
+ void DEBUG_StopQMPServer() {
+     QMP_StopServer();
+ }
+
+ bool DEBUG_IsQMPServerRunning() {
+     return QMP_IsServerRunning();
+ }
+
+ void DEBUG_CloseDebugger() {
+     // Signal the debug loop to exit and resume normal execution
+     exitLoop = true;
+     debugging = false;
+     LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: Closing debugger UI");
+ }
+
+ bool DEBUG_IsDebuggerActive() {
+     // Check if any form of debugging is active
+     if (debugging) return true;
+     if (gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
+         return true;
+     }
+     return false;
+ }
+
+ bool DEBUG_IsCpuPausedForDebug() {
+     // Check if CPU is paused for any debugging reason
+     // Interactive debugger: debugging=true && !debug_running
+     if (debugging && !debug_running) return true;
+#if C_REMOTEDEBUG
+     // GDB server: check local gdb_cpu_paused flag
+     if (gdbServer != nullptr && gdbServer->is_running() && gdb_cpu_paused) {
+         return true;
+     }
+#endif
+     return false;
+ }
+
+ const char* DEBUG_GetDebuggerPauseReason() {
+     // Return the reason for debug pause, or nullptr if not paused
+#if C_REMOTEDEBUG
+     if (gdbServer != nullptr && gdbServer->is_running() && gdb_cpu_paused) {
+         return "gdb";
+     }
+#endif
+     if (debugging && !debug_running) {
+         // Could be breakpoint, step, or user-initiated
+         // For now, just return "breakpoint" as that's the most common case
+         return "breakpoint";
+     }
+     return nullptr;
+ }
+
+ bool DEBUG_IsInteractiveDebuggerActive() {
+     return debugging;
+ }
+
+ bool DEBUG_IsGDBClientConnected() {
+     return gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client();
+ }
+
+ void DEBUG_SetGDBBreakOnExec(bool enable) {
+     gdb_break_on_exec = enable;
+     LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: GDB break on exec %s", enable ? "enabled" : "disabled");
+ }
+
+ bool DEBUG_IsGDBBreakOnExecPending() {
+     return gdb_break_on_exec;
+ }
+#endif /* C_REMOTEDEBUG */
 
 
 #endif // DEBUG

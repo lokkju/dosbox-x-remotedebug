@@ -3266,6 +3266,14 @@ bool CPU_IsHLTed(void) {
 	return (cpudecoder == &HLT_Decode);
 }
 
+void CPU_ExitHLT(void) {
+	/* Force exit from HLT state by restoring the old decoder and advancing past HLT */
+	if (cpudecoder == &HLT_Decode) {
+		cpudecoder = cpu.hlt.old_decoder;
+		reg_eip++;  // HLT is 1 byte (0xF4), skip past it
+	}
+}
+
 void CPU_HLT(uint32_t oldeip) {
 	/* Since cpu.hlt.old_decoder assigns the current decoder to old, and relies on restoring
 	 * it back when finished, setting cpudecoder to HLT_Decode while already HLT_Decode effectively

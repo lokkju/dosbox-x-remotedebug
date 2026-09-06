@@ -34,6 +34,9 @@
 #include "regs.h"
 #include "cpu.h"
 #include "ide.h"
+#if C_DEBUG
+#include "debug.h"
+#endif
 #include "../dos/drives.h"
 #include "../ints/int10.h"
 #include "../libs/tinyfiledialogs/tinyfiledialogs.h"
@@ -960,6 +963,53 @@ bool dos_debug_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const me
 
     return true;
 }
+
+#if C_REMOTEDEBUG
+void UpdateRemoteDebugMenuCheckmarks() {
+    mainMenu.get_item("debug_gdbserver").check(DEBUG_IsGDBServerRunning()).refresh_item(mainMenu);
+    mainMenu.get_item("debug_qmpserver").check(DEBUG_IsQMPServerRunning()).refresh_item(mainMenu);
+}
+
+bool gdbserver_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menuitem) {
+    (void)menu;//UNUSED
+    (void)menuitem;//UNUSED
+
+    Section_prop *section = static_cast<Section_prop*>(control->GetSection("dosbox"));
+    bool enabled = DEBUG_IsGDBServerRunning();
+
+    if (enabled) {
+        DEBUG_StopGDBServer();
+        SetVal("dosbox", "gdbserver", "false");
+    } else {
+        int port = section ? section->Get_int("gdbserver port") : 2159;
+        DEBUG_StartGDBServer(port);
+        SetVal("dosbox", "gdbserver", "true");
+    }
+
+    UpdateRemoteDebugMenuCheckmarks();
+    return true;
+}
+
+bool qmpserver_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menuitem) {
+    (void)menu;//UNUSED
+    (void)menuitem;//UNUSED
+
+    Section_prop *section = static_cast<Section_prop*>(control->GetSection("dosbox"));
+    bool enabled = DEBUG_IsQMPServerRunning();
+
+    if (enabled) {
+        DEBUG_StopQMPServer();
+        SetVal("dosbox", "qmpserver", "false");
+    } else {
+        int port = section ? section->Get_int("qmpserver port") : 4444;
+        DEBUG_StartQMPServer(port);
+        SetVal("dosbox", "qmpserver", "true");
+    }
+
+    UpdateRemoteDebugMenuCheckmarks();
+    return true;
+}
+#endif
 
 void OutputSettingMenuUpdate(void);
 void MENU_swapstereo(bool enabled);
@@ -3895,6 +3945,12 @@ void AllocCallback1() {
                         set_callback_function(dos_debug_menu_callback);
                     mainMenu.alloc_item(DOSBoxMenu::item_type_id,"debug_logfileio").set_text("Log file I/O").
                         set_callback_function(dos_debug_menu_callback);
+#if C_REMOTEDEBUG
+                    mainMenu.alloc_item(DOSBoxMenu::item_type_id,"debug_gdbserver").set_text("GDB Server").
+                        set_callback_function(gdbserver_menu_callback);
+                    mainMenu.alloc_item(DOSBoxMenu::item_type_id,"debug_qmpserver").set_text("QMP Server").
+                        set_callback_function(qmpserver_menu_callback);
+#endif
                 }
             }
         }

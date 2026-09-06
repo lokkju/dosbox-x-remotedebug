@@ -72,6 +72,7 @@ extern "C" {
 bool video_debug_overlay = false;
 bool skip_encoding_unchanged_frames = false, show_recorded_filename = true;
 std::string pathvid = "", pathwav = "", pathmtw = "", pathmid = "", pathopl = "", pathscr = "", pathprt = "", pathpcap = "";
+static std::string last_screenshot_path = "";  // Persists after pathscr is cleared, for remote debugging
 bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
 extern std::string working_dir;
 
@@ -987,6 +988,8 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
 		fclose(fp);
 		if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
 
+		// Save path for remote debugging before clearing
+		if (pathscr.size()) last_screenshot_path = pathscr;
 	}
 	pathscr = "";
 skip_shot:
@@ -1652,6 +1655,31 @@ void CAPTURE_RawScreenShotEvent(bool pressed) {
 #endif
 }
 #endif
+
+// Screenshot API for remote debugging (QMP)
+void CAPTURE_TakeScreenshot() {
+#if (C_SSHOT) && !defined(C_EMSCRIPTEN)
+	CaptureState |= CAPTURE_IMAGE;
+#endif
+}
+
+bool CAPTURE_IsScreenshotPending() {
+#if (C_SSHOT) && !defined(C_EMSCRIPTEN)
+	return (CaptureState & CAPTURE_IMAGE) != 0;
+#else
+	return false;
+#endif
+}
+
+std::string CAPTURE_GetLastScreenshotPath() {
+	std::string result = last_screenshot_path;
+	last_screenshot_path.clear();  // Clear after reading so subsequent calls don't return stale path
+	return result;
+}
+
+void CAPTURE_ClearLastScreenshotPath() {
+	last_screenshot_path.clear();
+}
 
 MixerChannel * MIXER_FirstChannel(void);
 

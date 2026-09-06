@@ -51,6 +51,44 @@ bool auto_save_state=false;
 bool noremark_save_state = false;
 bool force_load_state = false;
 std::string saveloaderr="";
+
+#if C_REMOTEDEBUG
+// Async save/load state request mechanism for QMP
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+
+enum class SaveStateRequest { NONE, SAVE, LOAD };
+static std::atomic<SaveStateRequest> pending_savestate_request{SaveStateRequest::NONE};
+static std::string pending_savestate_path;
+static std::string savestate_result_error;
+static std::atomic<bool> savestate_request_complete{false};
+static std::mutex savestate_mutex;
+static std::condition_variable savestate_cv;
+
+/* The save/load failure paths report through notifyError(), which opens a
+ * modal message box. A modal dialog blocks the emulation thread until a human
+ * dismisses it, and under a headless video driver nobody ever can: the
+ * emulator then stops executing, stops answering GDB and QMP, and never
+ * recovers. While a remote-debug request is being serviced the message is
+ * captured here instead and handed back to the requesting client as the
+ * command's error. Only the remote-driven path is affected; an interactive
+ * save or load still shows the dialog. */
+static bool savestate_suppress_dialogs = false;
+static std::string savestate_suppressed_error;
+
+namespace {
+	struct SaveStateDialogSuppressor {
+		SaveStateDialogSuppressor() {
+			savestate_suppressed_error.clear();
+			savestate_suppress_dialogs = true;
+		}
+		~SaveStateDialogSuppressor() {
+			savestate_suppress_dialogs = false;
+		}
+	};
+}
+#endif
 void refresh_slots(void);
 void GFX_LosingFocus(void), GFX_ReleaseMouse(void), MAPPER_ReleaseAllKeys(void), resetFontSize(void);
 bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
@@ -149,6 +187,14 @@ namespace
 	void notifyError(const std::string& message, bool log=true)
 	{
 		if (log) LOG_MSG("%s",message.c_str());
+#if C_REMOTEDEBUG
+		if (savestate_suppress_dialogs) {
+			/* Never block the emulation thread on a dialog for a request that
+			 * arrived over the wire: keep the first message for the client. */
+			if (savestate_suppressed_error.empty()) savestate_suppressed_error = message;
+			return;
+		}
+#endif
 		systemmessagebox("Error",message.c_str(),"ok","error", 1);
 	}
 
@@ -307,6 +353,115 @@ void LoadGameState_Run(void) { LoadGameState(true); }
 void NextSaveSlot_Run(void) { NextSaveSlot(true); }
 void PreviousSaveSlot_Run(void) { PreviousSaveSlot(true); }
 void LastAutoSaveSlot_Run(void) { LastAutoSaveSlot(true); }
+
+#if C_REMOTEDEBUG
+// Request save state to file (called from QMP thread)
+void SAVESTATE_RequestSave(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(savestate_mutex);
+    pending_savestate_path = filepath;
+    savestate_result_error.clear();
+    savestate_request_complete.store(false);
+    pending_savestate_request.store(SaveStateRequest::SAVE);
+}
+
+// Request load state from file (called from QMP thread)
+void SAVESTATE_RequestLoad(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(savestate_mutex);
+    pending_savestate_path = filepath;
+    savestate_result_error.clear();
+    savestate_request_complete.store(false);
+    pending_savestate_request.store(SaveStateRequest::LOAD);
+}
+
+// Check if request is still pending
+bool SAVESTATE_IsPending() {
+    return pending_savestate_request.load() != SaveStateRequest::NONE;
+}
+
+// Check if request is complete and get error (empty string = success)
+bool SAVESTATE_IsComplete(std::string& error_out) {
+    if (savestate_request_complete.load()) {
+        std::lock_guard<std::mutex> lock(savestate_mutex);
+        error_out = savestate_result_error;
+        return true;
+    }
+    return false;
+}
+
+// Called from main loop to process pending save/load requests
+bool SAVESTATE_CheckPendingRequest() {
+    SaveStateRequest req = pending_savestate_request.load();
+    if (req == SaveStateRequest::NONE) {
+        return false;
+    }
+
+    std::string filepath;
+    {
+        std::lock_guard<std::mutex> lock(savestate_mutex);
+        filepath = pending_savestate_path;
+    }
+
+    // Set up to use file instead of slot, and disable dialogs
+    std::string old_savefilename = savefilename;
+    bool old_use_save_file = use_save_file;
+    bool old_noremark_save_state = noremark_save_state;
+    bool old_force_load_state = force_load_state;
+    savefilename = filepath;
+    use_save_file = true;
+    noremark_save_state = true;   // Skip the save remark dialog
+    force_load_state = true;      // Skip load compatibility dialogs
+
+    /* SaveState::save()/load() report most failures by calling notifyError()
+     * rather than by throwing, so the catch blocks below are not enough on
+     * their own: without this the emulation thread parks on a modal dialog
+     * that no automated client can dismiss. Suppression ends when this
+     * function returns. */
+    SaveStateDialogSuppressor no_dialogs;
+
+    std::string error;
+    try {
+        if (req == SaveStateRequest::SAVE) {
+            LOG_MSG("SAVESTATE: Saving to file: %s", filepath.c_str());
+            SaveState::instance().save(0);  // Slot doesn't matter when use_save_file is true
+        } else if (req == SaveStateRequest::LOAD) {
+            LOG_MSG("SAVESTATE: Loading from file: %s", filepath.c_str());
+            if (!GFX_IsFullscreen() && render.aspect) GFX_LosingFocus();
+            SaveState::instance().load(0);
+#if defined(USE_TTF)
+            if (ttf.inUse) resetFontSize();
+#endif
+        }
+    } catch (const SaveState::Error& err) {
+        error = err;
+        LOG_MSG("SAVESTATE: Error: %s", err.c_str());
+    } catch (const std::exception& e) {
+        error = e.what();
+        LOG_MSG("SAVESTATE: Exception: %s", e.what());
+    } catch (...) {
+        error = "Unknown exception";
+        LOG_MSG("SAVESTATE: Unknown exception caught");
+    }
+    if (error.empty() && !savestate_suppressed_error.empty())
+        error = savestate_suppressed_error;
+
+    // Restore previous settings
+    savefilename = old_savefilename;
+    use_save_file = old_use_save_file;
+    noremark_save_state = old_noremark_save_state;
+    force_load_state = old_force_load_state;
+
+    // Signal completion
+    {
+        std::lock_guard<std::mutex> lock(savestate_mutex);
+        savestate_result_error = error;
+    }
+    pending_savestate_request.store(SaveStateRequest::NONE);
+    savestate_request_complete.store(true);
+    savestate_cv.notify_all();
+
+    return true;
+}
+#endif
 
 void ShowStateInfo(bool pressed) {
 	if (!pressed) return;
