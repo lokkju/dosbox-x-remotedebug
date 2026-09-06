@@ -6177,13 +6177,13 @@ uint32_t DEBUG_GetRegister(int reg) {
      }
  }
 
- uint8_t DEBUG_ReadMemory(uint32_t address) {
-     uint8_t value;
-     if (mem_readb_checked(address, &value)) {
-         // Memory read failed
-         return 0;
-     }
-     return value;
+ bool DEBUG_ReadMemory(uint32_t address, uint8_t *value) {
+     /* mem_readb_checked returns TRUE on failure. Swallowing that and
+      * returning 0 made an unreadable byte indistinguishable from a byte
+      * that happens to be zero, so a client scanning memory could not tell
+      * where readable memory ends. Report the failure and let the caller
+      * decide. */
+     return !mem_readb_checked(address, value);
  }
 
  bool DEBUG_WriteMemory(uint32_t address, uint8_t value) {

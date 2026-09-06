@@ -101,6 +101,22 @@ value), so any breakpoint address at or above `0x10000` answered `OK` but
 never fired; below `0x10000` the two interpretations happen to agree, which
 is why it looked like it worked.
 
+### Failed Memory Reads
+
+`m` reads until the first byte it cannot read and returns the bytes before
+it, which may be fewer than requested -- RSP allows a short reply, and gdb
+reads one as "readable memory ends here". `E01` comes back only when the
+*first* byte fails, so any client reading mapped memory is unaffected.
+Previously an unreadable byte was hex-encoded as `00`, which a client could
+not tell apart from memory that is genuinely zero.
+
+Note what this does *not* buy you in real mode. An address no device claims
+does not fail: the unmapped and illegal page handlers answer `0xFF`, the way
+real hardware does, and report success. Only the paging handlers fail a
+read, so a short reply or `E01` is reachable only once the guest has enabled
+paging. In a plain DOS guest, `m` over unclaimed space still returns `0xFF`
+bytes rather than an error.
+
 ### Capability Negotiation
 
 `qSupported` advertises two vendor feature strings naming the two behaviors

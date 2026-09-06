@@ -29,7 +29,13 @@ Bitu DEBUG_EnableDebugger(void);
 // Exposed for GDB server
 uint32_t DEBUG_GetRegister(int reg);
 void DEBUG_SetRegister(int reg, uint32_t value);
-uint8_t DEBUG_ReadMemory(uint32_t address);
+/* Returns true if the byte was read. A read of unmapped or
+ * not-present memory fails; the GDB stub stops its `m` reply at the
+ * first failure rather than passing a fabricated byte off as guest
+ * state. Note that in real mode with paging disabled a read of an
+ * address no device claims does NOT fail -- the unmapped page
+ * handler answers 0xFF, the way real hardware does. */
+bool DEBUG_ReadMemory(uint32_t address, uint8_t *value);
 /* Returns true if the byte landed. A write to unmapped or
  * write-protected memory fails; the GDB stub reports that as E01
  * rather than telling the client guest state changed when it did not. */

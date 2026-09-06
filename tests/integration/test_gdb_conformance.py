@@ -396,6 +396,76 @@ def test_write_memory_of_zero_length_is_accepted(gdb):
     assert gdb.send(f"M{M_SCRATCH:x},0:") == "OK"
 
 
+# -- m must report a failed read rather than fabricating a byte ------------
+#
+# The stub used to swallow mem_readb_checked's result and hex-encode a 0, so
+# "this byte is zero" and "this byte could not be read" were the same reply.
+# It now stops at the first byte it cannot read and returns the ones before
+# it, answering E01 only when the very first byte fails -- a short reply is
+# legal in RSP and is how gdb learns where readable memory ends.
+#
+# NOTE ON COVERAGE. Nothing below asserts E01, because in this configuration
+# no address can produce it. DOSBox-X's real-mode read path only fails
+# through the paging handlers (src/cpu/paging.cpp), and a plain DOS guest
+# never turns paging on. An address no device claims goes to the unmapped or
+# illegal page handler, which inherits PageHandler::readb_checked -- that
+# calls readb() and returns success, and readb() answers 0xFF the way real
+# hardware does. Probed across the whole 32-bit space (0xA0000, 0x1000000,
+# 0x10000000, 0x40000000, 0x80000000, 0xC0000000, 0xFFFFF000): every one
+# answered 0xFF bytes, never an error. The E01 path was verified separately
+# by temporary fault injection into DEBUG_ReadMemory; what these tests pin is
+# the half that is observable from a client, namely that the read-until-
+# failure loop returns every byte of a readable region and does not truncate.
+
+M_READ_SCRATCH = 0x30400
+PATTERN = bytes((i * 7 + 3) & 0xFF for i in range(64))
+
+
+def test_memory_read_returns_every_byte_of_a_readable_region(gdb):
+    """The read loop now stops early on failure. Nothing readable may be
+    dropped by it: a scan of RAM must still come back whole."""
+    gdb.halt()
+    assert gdb.write_memory(M_READ_SCRATCH, PATTERN) is True
+    reply = gdb.send(f"m{M_READ_SCRATCH:x},{len(PATTERN):x}")
+    assert not reply.startswith("E"), (
+        f"m over freshly written RAM returned {reply!r}")
+    assert bytes.fromhex(reply) == PATTERN
+
+
+def test_memory_read_of_a_zero_filled_region_is_not_an_error(gdb):
+    """The whole point of the change is that zero bytes and unreadable bytes
+    stop being the same answer -- so genuinely zero memory must still read
+    back as zeros, at full length, with no E01."""
+    gdb.halt()
+    zeros = b"\x00" * 32
+    assert gdb.write_memory(M_READ_SCRATCH, zeros) is True
+    reply = gdb.send(f"m{M_READ_SCRATCH:x},{len(zeros):x}")
+    assert reply == "00" * len(zeros), (
+        f"a zeroed region should read back as zeros, got {reply!r}")
+
+
+def test_memory_read_of_unclaimed_real_mode_space_still_succeeds(gdb):
+    """Pins the deliberate deviation. 0xA0000 is the VGA aperture, which no
+    handler claims in text mode; DOSBox-X answers 0xFF there rather than
+    failing, so `m` succeeds. A future change to all-or-nothing E01 would
+    break every consumer reading this region -- this test is the tripwire."""
+    gdb.halt()
+    reply = gdb.send("ma0000,8")
+    assert reply == "ff" * 8, (
+        f"unclaimed real-mode space should read as 0xFF, got {reply!r}")
+
+
+def test_memory_read_spanning_into_unclaimed_space_is_not_truncated(gdb):
+    """A read that crosses out of RAM at 0xA0000 must still return the full
+    count: the bytes past the boundary are readable 0xFF, not failures, so
+    the early-exit loop must not stop at them."""
+    gdb.halt()
+    reply = gdb.send("m9fffc,8")
+    assert not reply.startswith("E"), f"m across 0xA0000 returned {reply!r}"
+    assert len(bytes.fromhex(reply)) == 8, (
+        f"m across 0xA0000 returned {len(reply) // 2} of 8 bytes: {reply!r}")
+
+
 # -- p and G must bound-check register indices the way P already does ------
 
 def test_read_register_rejects_an_out_of_range_index(gdb):

@@ -487,9 +487,22 @@ void GDBServer::handle_read_memory(const std::string& args) {
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
 
-    for (uint32_t i = 0; i < length; ++i) {
-        uint8_t value = DEBUG_ReadMemory(address + i);
+    /* Read until the first byte that cannot be read, then stop. RSP allows
+     * a reply shorter than the requested length, and gdb treats the short
+     * reply as "readable memory ends here" -- which is the whole point.
+     * Reporting E01 only when nothing at all could be read keeps every
+     * client that reads mapped memory working exactly as before, while no
+     * longer passing a fabricated 0 off as guest state. */
+    uint32_t read = 0;
+    for (; read < length; ++read) {
+        uint8_t value;
+        if (!DEBUG_ReadMemory(address + read, &value)) break;
         ss << std::setw(2) << static_cast<int>(value);
+    }
+
+    if (read == 0 && length != 0) {
+        send_packet("E01");
+        return;
     }
 
     send_packet(ss.str());
